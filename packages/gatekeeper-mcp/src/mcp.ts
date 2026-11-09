@@ -4,8 +4,8 @@
 // writes are queued rather than performed inline, and per-tool TypeScript is generated from the
 // server's schemas so Gadget code gets typed methods.
 //
-// The endpoint is whatever a user typed, so annotations never earn auto-approval here and a Gadget
-// bound to it is owner-only. See `sharing-policy.ts` and the README.
+// The endpoint is whatever a user typed, so annotations never earn auto-approval here. Collaborators
+// authenticate separately and each runtime uses its viewer's connected account.
 import { RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
 import { validateRpc, skipRpcValidation } from "capnweb-validate";
 import { createLogger } from "@gadgets/observability/logger";
@@ -37,7 +37,12 @@ import { generateSessionTypes, sessionTypeName } from "@gadgets/mcp-shared/schem
 import { McpAccountBase, type ConnectedServer, type ConnectOutcome }
   from "@gadgets/mcp-shared/account";
 import { generateNonce } from "@gadgets/mcp-shared/connect-nonce";
-import { fetchTools, withClient, type ConnectionAccount } from "@gadgets/mcp-shared/connection";
+import {
+  fetchTools,
+  withClient,
+  type ConnectionAccount,
+  type McpObserverAccount,
+} from "@gadgets/mcp-shared/connection";
 import { McpSessionBase } from "@gadgets/mcp-shared/session";
 import { McpFacetBase } from "@gadgets/mcp-shared/facet";
 import { looksLikePortal } from "@gadgets/mcp-shared/portal";
@@ -66,7 +71,6 @@ import {
 } from "@gadgets/mcp-shared/user";
 import { connectFormHtml } from "./connect-form.js";
 import { serverIdFromEndpoint } from "./server-id.js";
-import { assertOwnServerSubresources, serverSubresourceId } from "./server-subresources.js";
 import { mcpResourceFor, mcpResources } from "./resources.js";
 import type { ConfiguratorUIOption } from "@gadgets/configurator-ui";
 import { MCP_BASE_TYPES } from "@gadgets/mcp-shared/base-types";
@@ -77,7 +81,7 @@ import type { McpServerConfiguratorRpc } from "./configurator/server-configurato
 const VENDOR_ID = "mcp";
 
 // A user-supplied endpoint vouches only for itself, so its annotations never drive auto-approval.
-// The tier says nothing about sharing; a Gadget bound to either tier is owner-only.
+// Collaborator access is handled per-user by the shared MCP facet; this tier governs tool trust only.
 const TRUST: ServerTrust = "byo";
 
 const logger = createLogger<McpLogFields>({ component: "gatekeeper.mcp", vendorId: VENDOR_ID });
@@ -337,18 +341,50 @@ export class GatekeeperUserImpl
 
   @skipRpcValidation()
   async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
-    return this.ctx.exports.McpVerifier({});
+    return this.ctx.exports.McpVerifier({
+      props: {accountObjectId: this.ctx.props.accountObjectId},
+    });
   }
 }
 
 // ---------------------------------------------------------------------------
 // Verifier
 
-// Required by the `GatekeeperUser` contract but never interrogated, since `addObserver` and
-// `verifyObserverAccess` refuse everyone. Carries no props for the same reason.
+type McpVerifierProps = {accountObjectId: string};
+
+// The verifier is an account capability. The overseer passes it only to this MCP vendor's facet.
 @validateRpc()
-export class McpVerifier extends WorkerEntrypoint<Env> implements GatekeeperUserVerifier {
+export class McpVerifier extends WorkerEntrypoint<Env, McpVerifierProps>
+  implements GatekeeperUserVerifier, McpObserverAccount {
+  #account(): DurableObjectStub<McpAccount> {
+    return this.ctx.exports.McpAccount.get(
+      this.ctx.exports.McpAccount.idFromString(this.ctx.props.accountObjectId));
+  }
+
   verify(): void {}
+
+  async getAccountObjectId(): Promise<string> {
+    return this.ctx.props.accountObjectId;
+  }
+
+  async verifyEndpoint(endpoint: string): Promise<void> {
+    const server = await this.#account().getServer();
+    if (!sameEndpoint(server.endpoint, endpoint)) {
+      throw new Error(`This account is connected to ${server.endpoint}, not ${endpoint}.`);
+    }
+  }
+
+  getConnection(endpoint: string) { return this.#account().getConnection(endpoint); }
+  assertConnectionCurrent(endpoint: string, generation: number) {
+    return this.#account().assertConnectionCurrent(endpoint, generation);
+  }
+  setMcpSessionId(
+      endpoint: string, generation: number, previous: string | null, next: string | null) {
+    return this.#account().setMcpSessionId(endpoint, generation, previous, next);
+  }
+  noteCredentialsExpired(endpoint: string, generation: number) {
+    return this.#account().noteCredentialsExpired(endpoint, generation);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +479,11 @@ export class McpGatekeeperImpl
       this.ctx.exports.McpAccount.idFromString(this.ctx.props.accountObjectId));
   }
 
+  protected accountForObserver(accountObjectId: string): ConnectionAccount {
+    return this.ctx.exports.McpAccount.get(
+      this.ctx.exports.McpAccount.idFromString(accountObjectId));
+  }
+
   protected get trust(): ServerTrust {
     return TRUST;
   }
@@ -451,44 +492,17 @@ export class McpGatekeeperImpl
     return McpSessionImpl;
   }
 
-  protected get observerName(): string {
-    return `the MCP server ${hostOf(this.ctx.props.endpoint)}`;
-  }
-
   get serverName(): string {
     return this.ctx.props.serverName;
   }
 
   /**
-   * Every read through this binding reports `server/<serverId>`. `serverId` has been written into
-   * the props of every binding since this gatekeeper was added, so no older binding lacks it. It is
-   * a display slug and can collide across hosts, which is harmless: `verifyObserverAccess` admits
-   * nobody, and endpoint equality and action-kind tags keep using the full endpoint.
+   * None: a pasted endpoint names no resource whose access a collaborator could be checked
+   * against. A "use" collaborator reads in a runtime of their own with their own account, and the
+   * inherited `addObserver` refuses everyone who would open the whole workspace.
    */
-  get observationSubresources(): string[] {
-    return [serverSubresourceId(this.ctx.props.serverId)];
-  }
-
-  /**
-   * Private-only: a valid `server/<serverId>` for this binding admits no observer, since being
-   * able to authenticate to a pasted endpoint is not evidence of being allowed to see what the
-   * owner read from it. Any other ID fails the whole call, which denies everyone in it. The
-   * inherited `addObserver` still refuses everyone, for reads recorded before subresources.
-   */
-  async verifyObserverAccess(
-    _observers: { id: string; verifier: Fetcher<GatekeeperUserVerifier> }[],
-    subresources: string[],
-  ): Promise<{ allowedObserverIds: string[] }> {
-    assertOwnServerSubresources(subresources, this.ctx.props.serverId);
-    return { allowedObserverIds: [] };
-  }
-
-  /**
-   * The inherited `addObserver` refused everyone, and nothing recorded proves a binding never
-   * read, so history exports the same `server/<serverId>` reads report, which admits nobody.
-   */
-  async getHistoricalSubresources(): Promise<string[]> {
-    return [serverSubresourceId(this.ctx.props.serverId)];
+  get observationSubresources(): undefined {
+    return undefined;
   }
 
   async describe(): Promise<ResourceDescription> {

@@ -617,6 +617,30 @@ describe("restarting sessions when verification scope widens", () => {
     expect(restarts).toEqual([]);
   }));
 
+  it("tells each connection what the collaborator is being admitted for",
+      () => withImpl(async (impl) => {
+    seedGatekeeper(impl, 1);
+    seedGadget(impl, 100);
+    impl.bindWorkpiece(100, "DB", 1);
+    impl.storage.observers.put(
+        { profileId: "alice", observerId: "obs-1", accountChoices: { 1: 10 } });
+    let admissions: unknown[] = [];
+    impl.getGatekeeperFacet = () => ({
+      addObserver: async (_id: string, _verifier: unknown, admission?: unknown) => {
+        admissions.push(admission);
+      },
+      removeObserver: async () => {},
+    });
+    let fakeClientUser =
+        { getVerifier: async () => ({}), describeConnectedAccount: async () => null } as any;
+
+    // A build collaborator reads the workspace's chats; a use collaborator only runs the gadget.
+    await impl.ensureObserver("alice", fakeClientUser, "workspace");
+    await impl.ensureObserver("alice", fakeClientUser, { gadgetId: 100 });
+
+    expect(admissions).toEqual(["workspace", "gadget"]);
+  }));
+
   // A pre-creationSpec record, which observerVendorId() refuses to classify: nobody can be
   // verified against it, so sharing anything that reaches it requires the owner to remove it first.
   function seedLegacyGatekeeper(impl: any, id: number): void {

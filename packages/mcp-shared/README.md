@@ -34,7 +34,7 @@ does so through a named hook (`staticToken`, `mintAccount`), not a private copy.
 | `connection` | `withClient` — transport sessions, retries, credential-expiry reporting |
 | `action-store` | Staged to applied/rejected/failed, with a bound on what is retained and a claim so one approval is never sent twice |
 | `session` | The Gadget-facing capability, and the one path every tool call takes |
-| `sharing-policy` | The owner-only sharing rule |
+| `user` | The account capability used for per-viewer MCP sessions |
 | `html` | The connect-flow pages, so both connectors look like one product |
 | `http` | Base-path, OAuth callback, and connect-link routing shared by both Workers |
 | `log` | The field vocabulary both connectors log against |
@@ -70,15 +70,13 @@ Annotations are optional in MCP and most servers publish none. Every hint is com
 auto-apply, on either tier. That matches the spec's own defaults (`readOnlyHint: false`,
 `destructiveHint: true`, `idempotentHint: false`).
 
-Neither tier can be shared. A Gadget bound to any MCP endpoint is shared with nobody beyond the
-account it reads with, for reasons unrelated to provenance — see
-[`sharing-policy.ts`](src/sharing-policy.ts). Each connector declares, through
-`McpSessionHost.observationSubresources`, what every read the session makes reports as
-`subresources`: the portal connector its upstream server (`server/<upstreamServerId>`), which its
-`verifyObserverAccess()`, like its `addObserver()`, grants only to the account the binding reads
-with; the bare connector its server (`server/<serverId>`, the binding's display slug), which its
-`verifyObserverAccess()` grants to nobody, while its `addObserver()` still refuses everyone for
-reads made before they reported it.
+Both tiers can be shared through a Gadget's per-user runtime. A collaborator with "use" access must
+connect an account for the same endpoint; MCP discovery, reads, and approved writes then use that
+account. Each collaborator's Gadget runtime storage is isolated from the owner's and other
+collaborators'. A collaborator with "build" access reads the chats, which hold what the binding's
+account returned, so `addObserver` refuses them by default (`admitWorkspaceObserver`); the portal
+connector admits only the binding's own account.
+The MCP endpoint remains untrusted for write auto-approval regardless of sharing.
 
 What an account records instead of a tier is `provenance`, `"user"` or `"deployment"`, settled when
 it connects. Provenance decides whether a server may rename itself over an administrator's chosen

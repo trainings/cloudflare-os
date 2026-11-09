@@ -10788,7 +10788,8 @@ class OverseerImpl implements AgentHooks {
             // exclusion teardown's removeObserver for the same pair is still in flight (which
             // would delete it moments later); see #withObserverGatekeeperLock.
             await this.#withObserverGatekeeperLock(observerId, gk.id,
-                async () => (await this.getGatekeeperFacet(gk.id)).addObserver(observerId, verifier));
+                async () => (await this.getGatekeeperFacet(gk.id)).addObserver(
+                    observerId, verifier, grant === "workspace" ? "workspace" : "gadget"));
             let done = checked.get(gk.id) ?? new Set<string>();
             let unchecked = (scope.requirements.get(gk.id) ?? []).filter(id => !done.has(id));
             if (unchecked.length > 0) {
