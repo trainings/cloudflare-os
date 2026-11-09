@@ -2415,8 +2415,31 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
 
       let credentialsValid = areCredentialsValid(record);
 
+      // Older connected-account records may predate `grantedResourceUrlPatterns`. Refresh only
+      // that missing metadata from the live account description so Gatekeepers that now report
+      // their grants can update existing accounts without reconnecting. Keep the persisted account
+      // description as a fallback if the Gatekeeper cannot be reached during this subscription.
+      let accountDescription = record.description;
+      if (accountDescription.grantedResourceUrlPatterns === undefined &&
+          supportedResources.some(resource => resource.grantable)) {
+        try {
+          let currentDescription = await record.account.describe();
+          if (currentDescription.grantedResourceUrlPatterns !== undefined) {
+            accountDescription = {
+              ...accountDescription,
+              grantedResourceUrlPatterns: currentDescription.grantedResourceUrlPatterns,
+            };
+          }
+        } catch (err) {
+          logger.warn("failed to refresh connected account grant metadata", {
+            event: "connected.account.grant.metadata.refresh.failed",
+            accountId: record.id, vendorId: record.vendorId, error: err,
+          });
+        }
+      }
+
       seenIds.add(record.id);
-      subscriber.add(record.id, record.description, vendorDescription,
+      subscriber.add(record.id, accountDescription, vendorDescription,
           supportedResources, credentialsValid, record.vendorId).catch(unsubscribe)
     }
 
