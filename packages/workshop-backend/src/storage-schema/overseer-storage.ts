@@ -1167,6 +1167,20 @@ export type ShareKeyAliasRecord = {
  */
 export type ShareKeyRecord = ShareLinkRecord | ShareKeyAliasRecord;
 
+/** A user-scoped Gadget runtime facet created for a shared Gadget UI session. */
+export type GadgetRuntimeRecord = {
+  gadgetId: WorkpieceId;
+  runtimeKey: string;
+  facetName: string;
+};
+
+/** Authenticated viewer context attached server-side to a collaborator's Gadget runtime. */
+export type GadgetViewer = {
+  userId: string;
+  profileId: string;
+  runtimeKey: string;
+};
+
 /**
  * Storage record of a non-owner collaborator's observer identity and the gatekeeper accounts they
  * chose for it. Their first admission -- to the workspace, for a "build" collaborator, or to one
@@ -1566,6 +1580,12 @@ export function makeOverseerStorage(storage: DurableObjectStorage) {
       // each is cloned. A snapshot lives no longer than the instance that made it, whose sessions
       // are its only users, so the next instance deletes every one still recorded.
       gadgetSnapshots: collection<{facetName: string; gadgetId: WorkpieceId}>()({
+        primaryKey: "facetName",
+      }),
+
+      // Shared Gadget source code can run in a separate runtime for each collaborator. This keeps
+      // per-user MCP credentials and runtime storage from crossing between viewers.
+      gadgetRuntimes: collection<GadgetRuntimeRecord>()({
         primaryKey: "facetName",
       }),
 
