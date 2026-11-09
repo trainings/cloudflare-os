@@ -6509,7 +6509,10 @@ class OverseerImpl implements AgentHooks {
 
     // Same auto-approval gate the drainer uses, named because awaitDecision uses it too. The drain
     // is deferred because applying calls back into the gatekeeper facet still awaiting submitAction.
-    let willAutoApprove = autoApprovalRule(this.storage, gatekeeperId, description) !== undefined;
+    // A collaborator's observer action is never auto-approved by workspace rules: it applies with
+    // their own account, so only they may approve it.
+    let willAutoApprove = viewer === undefined &&
+        autoApprovalRule(this.storage, gatekeeperId, description) !== undefined;
     if (!willAutoApprove) this.traceAgentActionApproval(record, "requested");
 
     // Only agent turns suspend on awaitDecision, and only when a manual decision is pending: on this
@@ -6517,7 +6520,7 @@ class OverseerImpl implements AgentHooks {
     // seamless behavior the user opted into.
     if (caller.from === "agent" && description.awaitDecision && (!willAutoApprove ||
         [...this.storage.actions.pendingByGatekeeper.get(gatekeeperId)].some(queued =>
-            queued.type === "action" &&
+            queued.type === "action" && queued.observerProfileId === undefined &&
             autoApprovalRule(this.storage, gatekeeperId, queued.description) === undefined))) {
       this.#getOrCreateCapturedActions(caller.chatId).awaitDecision = true;
     }
