@@ -20,7 +20,7 @@ import {
   type BlueprintGadgetRecord, type BoundHookRecord, type ChatBindingEntry,
   type ChatChangeBoundaryRecord, type ChatChangeRecord, type ChatFanoutStart, type CompactionCheckpoint,
   type ExternalChatRecord, type ExternalMessageRecord, type GadgetRecord, type GatekeeperCaller,
-  type GatekeeperClass, type GatekeeperRecord, type ObserverRecord, type OverseerStorage,
+  type GadgetViewer, type GatekeeperClass, type GatekeeperRecord, type ObserverRecord, type OverseerStorage,
   type StoredAssistantMessage, type StoredChatMessage, type StoredChatMetadata,
   type WorkpieceRecord, type WorktreeRecord,
 } from "./storage-schema/overseer-storage";
@@ -66,6 +66,7 @@ import {
   releasesMergedBy, type Release,
 } from "./blueprint-release";
 import { EMPTY_TREE_OID, gitObjectOid, parseGitCommitRefs } from "./git-codec";
+import { agentViewerProfileId } from "./observer-actions";
 import {
   listFeaturedBlueprintsFromKv, readBlueprintKvRecord, type BlueprintKvRecord,
 } from "./storage-schema/blueprints-kv";
@@ -254,18 +255,20 @@ class RestoreForgerImpl extends NativeRpcTarget {
   #impl: OverseerImpl;
   #chatId: number;
   #bindings: Record<string, ChatBindingEntry>;
+  #viewer?: GadgetViewer;
 
   constructor(impl: OverseerImpl, chatId: number,
-              bindings: Record<string, ChatBindingEntry>) {
+              bindings: Record<string, ChatBindingEntry>, viewer?: GadgetViewer) {
     super();
     this.#impl = impl;
     this.#chatId = chatId;
     this.#bindings = bindings;
+    this.#viewer = viewer;
   }
 
   forge(bindingName: string, params: unknown): Promise<unknown> {
     return this.#impl.forgeRestoreStubForBinding(
-        this.#chatId, this.#bindings, bindingName, params);
+        this.#chatId, this.#bindings, bindingName, params, this.#viewer);
   }
 }
 
@@ -1772,8 +1775,9 @@ class OverseerImpl implements AgentHooks {
   // Facet name for the given gadget. The facet name is a storage key, so the default gadget
   // keeps the legacy name "gadget"; all others get `gadget${id}` (collision-free with
   // `gatekeeper${id}` thanks to the shared workpiece counter).
-  gadgetFacetName(id: WorkpieceId): string {
-    return this.defaultGadgetId === id ? "gadget" : `gadget${id}`;
+  gadgetFacetName(id: WorkpieceId, runtimeKey?: string): string {
+    let base = this.defaultGadgetId === id ? "gadget" : `gadget${id}`;
+    return runtimeKey === undefined ? base : `${base}__user_${encodeURIComponent(runtimeKey)}`;
   }
 
   // Resolve an agent tool's optional workpiece reference. Absent means the workspace's default
@@ -2211,8 +2215,16 @@ class OverseerImpl implements AgentHooks {
 
     let affectedChats = this.#chatsProposing(id);
     let facetName = this.gadgetFacetName(id);
+    // Tear down the shared and user-scoped runtimes before the delete notifies subscribers, so
+    // nothing woken by the notification can reach a runtime of a gadget that no longer exists.
+    for (let runtime of Array.from(this.storage.gadgetRuntimes.list())
+        .filter(item => item.gadgetId === id)) {
+      this.#runningChatIds.delete(runtime.facetName);
+      this.ctx.facets.delete(runtime.facetName);
+      this.storage.gadgetRuntimes.delete(runtime.facetName);
+    }
     this.storage.gadgets.delete(id);  // notifies workpiece subscribers
-    this.#runningChatIds.delete(id);
+    this.#runningChatIds.delete(facetName);
     this.ctx.facets.delete(facetName);
     // An agent spawner may bind the gadget (see GatekeeperRecord.bindings).
     for (let chatId of this.#deleteBindingEdges(edge => edge.target === id)) {
@@ -2999,11 +3011,14 @@ class OverseerImpl implements AgentHooks {
         }));
   }
 
-  makeBindingLoopback(target: BindingLoopbackTarget, caller: GatekeeperCaller) {
+  makeBindingLoopback(
+      target: BindingLoopbackTarget, caller: GatekeeperCaller, viewer?: GadgetViewer) {
     let props: GatekeeperLoopbackProps = {
       overseerId: this.ctx.id.toString(),
       target,
       caller,
+      viewer,
+      viewerRequired: viewer !== undefined,
     };
     return this.ctx.exports.GatekeeperLoopback({props});
   }
@@ -3014,16 +3029,19 @@ class OverseerImpl implements AgentHooks {
   // chat is included (the chat's own preview/test runs see its proposed additions), while edges
   // pending in other chats -- or in any chat, when loading mainline -- are treated as
   // nonexistent.
-  getEnvForLoader(gadgetId: WorkpieceId, caller: GatekeeperCaller, forChatId?: number): object {
+  getEnvForLoader(
+      gadgetId: WorkpieceId, caller: GatekeeperCaller, forChatId?: number,
+      viewer?: GadgetViewer): object {
     let env: Record<string, any> = {}
     let gadget = this.getGadgetRecord(gadgetId);
-    env.GADGET = this.makeBindingLoopback({type: "gadget", id: gadgetId}, caller);
+    env.GADGET = this.makeBindingLoopback({type: "gadget", id: gadgetId}, caller, viewer);
     // Before the named bindings, so an edge named GIT from before the name was reserved still
     // shadows it (see bindWorkpiece). The agent's describeBinding tool mirrors this order when
     // describing a gadget's bindings (see describeBinding in agent.ts).
     env[GIT_BINDING_NAME] = this.makeBindingLoopback({type: "git"}, caller);
     for (let [name, edge] of this.visibleBindings(gadget, forChatId)) {
-      env[name] = this.makeBindingLoopback({type: "gatekeeper", id: edge.target}, caller);
+      env[name] = this.makeBindingLoopback(
+          {type: "gatekeeper", id: edge.target}, caller, viewer);
     }
     return env;
   }
@@ -3035,7 +3053,7 @@ class OverseerImpl implements AgentHooks {
   // behavior elsewhere. `executionId` is the calling executeCodeMode run, minted into worktree
   // loopbacks so they are usable only from within that execution.
   getEnvForAgent(chatId: number, bindings: Record<string, ChatBindingEntry>,
-                 executionId: string): object {
+                 executionId: string, viewer?: GadgetViewer): object {
     let caller: GatekeeperCaller = {from: "agent", chatId};
     // This must be a *plain* object: it becomes the loaded worker's `env`, and the loader's
     // serializer rejects anything else (including a null-prototype object) with DataCloneError.
@@ -3062,8 +3080,8 @@ class OverseerImpl implements AgentHooks {
           let record = this.storage.gadgets.get(entry.id);
           if (record?.type === "gadget") {
             env[name] = {
-              rpc: this.makeBindingLoopback({type: "gadget", id: entry.id}, caller),
-              exports: this.makeBindingLoopback({type: "exports", id: entry.id}, caller),
+              rpc: this.makeBindingLoopback({type: "gadget", id: entry.id}, caller, viewer),
+              exports: this.makeBindingLoopback({type: "exports", id: entry.id}, caller, viewer),
             };
           } else if (record?.type === "worktree") {
             // The programmatic Worktree binding (see worktree-session.ts). Served through the
@@ -3074,7 +3092,7 @@ class OverseerImpl implements AgentHooks {
                 {type: "worktree", id: entry.id, executionId}, caller);
           } else if (this.storage.gatekeepers.get(entry.id)) {
             env[name] = this.makeBindingLoopback(
-                {type: "gatekeeper", id: entry.id, executionId}, caller);
+                {type: "gatekeeper", id: entry.id, executionId}, caller, viewer);
           }
           break;
         }
@@ -3097,14 +3115,15 @@ class OverseerImpl implements AgentHooks {
     return env;
   }
 
-  // Which chat ID is each gadget's facet currently running from? Keyed by gadget ID; a gadget
-  // with no entry has never had its facet loaded this session.
-  #runningChatIds = new Map<WorkpieceId, number | null>();
+  // Which chat ID each Gadget runtime facet is currently running from, keyed by facet name.
+  // User-scoped runtimes have their own facet names so code reloads and proposed-change
+  // transitions remain isolated. A facet with no entry has never been loaded this session.
+  #runningChatIds = new Map<string, number | null>();
 
   proposedChangesChanged(chatId: number) {
-    for (let [gadgetId, runningChatId] of this.#runningChatIds) {
+    for (let [facetName, runningChatId] of this.#runningChatIds) {
       if (runningChatId === chatId) {
-        this.ctx.facets.abort(this.gadgetFacetName(gadgetId), new Error(
+        this.ctx.facets.abort(facetName, new Error(
             "Gadget restarted because the proposed changes changed."));
       }
     }
@@ -4915,7 +4934,7 @@ class OverseerImpl implements AgentHooks {
   // If `chatId` is specified, load the worker from that chat's code doc instead, including its
   // proposed changes. (The caller is presumed to have verified the chat exists and has proposed
   // changes.)
-  loadGadgetWorker(gadgetId: WorkpieceId, chatId?: number): WorkerStub {
+  loadGadgetWorker(gadgetId: WorkpieceId, chatId?: number, runtime?: GadgetViewer): WorkerStub {
     let codeVersion = `${this.storage.codeVersion.get()}`;
     let sequence: number | undefined;
     // Snapshotted in the same synchronous step as the cache key's sequence: the loader callback
@@ -4929,7 +4948,9 @@ class OverseerImpl implements AgentHooks {
       codeVersion += `.${chatId}.${sequence}`;
     }
 
-    return this.env.LOADER.get(`${this.ctx.id}.${codeVersion}.${gadgetId}`, async () => {
+    return this.env.LOADER.get(
+        `${this.ctx.id}.${codeVersion}.${gadgetId}.${runtime?.runtimeKey ?? "shared"}`,
+        async () => {
       // The snapshot meta above serves the as-of-`sequence` doc build; this re-read only keeps
       // the old fail-on-deleted-chat behavior (don't cache a load for a chat deleted mid-load).
       if (chatId !== undefined) this.getChatMetaOrThrow(chatId);
@@ -4971,7 +4992,8 @@ class OverseerImpl implements AgentHooks {
         ],
         mainModule: "server.js",
         modules,
-        env: this.getEnvForLoader(gadgetId, {from: "gadget", chatId, gadgetId}, chatId),
+        env: this.getEnvForLoader(
+            gadgetId, {from: "gadget", chatId, gadgetId}, chatId, runtime),
         globalOutbound: null,
 
         // TODO: Switch to streaming tails when the workerd log spam issue is fixed.
@@ -4992,11 +5014,15 @@ class OverseerImpl implements AgentHooks {
   // `this.ctx.restore()` -- to hand a persistent callback to a spawned agent or a hook -- would
   // throw. Every stub to a gadget facet therefore comes from here; only [restore]() itself, which
   // is what ctx.restore() invokes, touches the raw facet (see #getGadgetFacetRaw).
-  async getGadgetFacetFetcher(gadgetId: WorkpieceId, chatId?: number)
+  async getGadgetFacetFetcher(gadgetId: WorkpieceId, chatId?: number, runtime?: GadgetViewer)
       : Promise<Fetcher<DurableObject>> {
     let params: OverseerRestoreParams = {type: "gadget", gadgetId};
     chatId = this.#resolveGadgetChatId(gadgetId, chatId);
     if (chatId !== undefined) params.chatId = chatId;
+    // Sealed into the persistent stub so that anything the collaborator's runtime persists
+    // (hook callbacks, spawned agents) restores to that same user-scoped runtime, never the
+    // shared one that holds the workspace owner's credentials.
+    if (runtime) params.runtime = runtime;
     return await this.ctx.restore(params);  // validates the gadget exists, in [restore]()
   }
 
@@ -5019,7 +5045,9 @@ class OverseerImpl implements AgentHooks {
   // The bare facet stub behind getGadgetFacetFetcher(). Only [restore]() may call this (see the
   // comment there): a request made on the returned stub leaves the facet unable to call its own
   // ctx.restore(). `chatId` must already be resolved by #resolveGadgetChatId.
-  #getGadgetFacetRaw(gadgetId: WorkpieceId, chatId: number | undefined): Fetcher<DurableObject> {
+  #getGadgetFacetRaw(
+      gadgetId: WorkpieceId, chatId: number | undefined, runtime?: GadgetViewer)
+      : Fetcher<DurableObject> {
     // If we switched chats since the last time we ran the gadget and either the old or new chat
     // has proposed changes, this means we're changing what code is running, so we need to reset
     // the gadget. this.#runningChatIds tracks, for each gadget, which chat's proposed changes are
@@ -5038,19 +5066,22 @@ class OverseerImpl implements AgentHooks {
     //
     // If/when we support hiberation of the overseer, we'll need to do something more
     // sophisticated.
-    let facetName = this.gadgetFacetName(gadgetId);
-    let oldChat = this.#runningChatIds.get(gadgetId);
+    let facetName = this.gadgetFacetName(gadgetId, runtime?.runtimeKey);
+    if (runtime) {
+      this.storage.gadgetRuntimes.put({gadgetId, runtimeKey: runtime.runtimeKey, facetName});
+    }
+    let oldChat = this.#runningChatIds.get(facetName);
     let newChat = chatId ?? null;
     if (newChat !== oldChat) {
       this.ctx.facets.abort(facetName, new Error(
           newChat === null
             ? "Gadget restarted to switch back to main version."
             : "Gadget restarted to test proposed changes."));
-      this.#runningChatIds.set(gadgetId, newChat);
+      this.#runningChatIds.set(facetName, newChat);
     }
 
     return this.ctx.facets.get<DurableObject>(facetName, () => {
-      let stub = this.loadGadgetWorker(gadgetId, chatId);
+      let stub = this.loadGadgetWorker(gadgetId, chatId, runtime);
 
       return {
         class: stub.getDurableObjectClass<any>("Gadget"),
@@ -5071,9 +5102,10 @@ class OverseerImpl implements AgentHooks {
   //
   // Since facet stubs currently can't be sent over RPC, the stub is wrapped in a Proxy to make it
   // look like an RpcTarget instead.
-  async getGadgetFacet(gadgetId: WorkpieceId, chatId?: number, joinAs?: SessionHolder)
+  async getGadgetFacet(
+      gadgetId: WorkpieceId, chatId?: number, joinAs?: SessionHolder, runtime?: GadgetViewer)
       : Promise<RpcStub<any>> {
-    let facet = await this.getGadgetFacetFetcher(gadgetId, chatId);
+    let facet = await this.getGadgetFacetFetcher(gadgetId, chatId, runtime);
     let leaveSession = joinAs ? this.joinSession(joinAs, gadgetId) : undefined;
 
     let self = this;
@@ -5608,19 +5640,23 @@ class OverseerImpl implements AgentHooks {
   }
 
   // Open the session behind a binding loopback.
-  startGatekeeperSession(target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
+  startGatekeeperSession(
+      target: BindingLoopbackTarget, caller: GatekeeperCaller, viewer?: GadgetViewer,
+      viewerRequired = false): Promise<any> {
     switch (target.type) {
       case "gadget": {
         if (caller.from === "agent") {
           this.#getOrCreateCapturedActions(caller.chatId).accessedGadget = true;
         }
         let chatId = "chatId" in caller ? caller.chatId : undefined;
-        return this.getGadgetFacet(target.id, chatId);
+        return this.getGadgetFacet(target.id, chatId, undefined, viewer);
       }
 
       case "gatekeeper":
         return this.getGatekeeperFacet(target.id).then(facet =>
-            this.openGatekeeperSession(target.id, facet, caller, target.executionId));
+            this.openGatekeeperSession(
+                target.id, facet, caller, target.executionId, undefined, viewer,
+                viewerRequired));
 
       case "worktree": {
         // The programmatic Worktree binding (worktree-session.ts). A worktree's uncommitted
@@ -6268,6 +6304,7 @@ class OverseerImpl implements AgentHooks {
     // #withObserverGatekeeperLock, so its registration is never silently undone.
     let allGatekeeperIds = [...this.storage.gatekeepers.list()].map(gk => gk.id);
     let removals = unauthorized.map(observer => {
+      this.#removeObserverRuntimes(this.#runtimeKeysOf(observer.profileId));
       this.storage.observers.delete(observer.profileId);
       return this.#removeObserverFromGatekeepers(observer.observerId, allGatekeeperIds);
     });
@@ -6724,6 +6761,11 @@ class OverseerImpl implements AgentHooks {
     for (let id of ids) {
       this.ctx.facets.abort(this.gadgetFacetName(id),
           new Error("Gadget restarted due to code update."));
+      for (let runtime of Array.from(this.storage.gadgetRuntimes.list())
+          .filter(item => item.gadgetId === id)) {
+        this.ctx.facets.abort(runtime.facetName,
+            new Error("Gadget restarted due to code update."));
+      }
     }
     this.bumpLastActive();
     return codeVersion;
@@ -6839,12 +6881,14 @@ class OverseerImpl implements AgentHooks {
   // only keeps the collaborator counted, which checks more reads, never fewer.
   openGatekeeperSession<Session extends RpcCompatible<Session>>(
       id: number, facet: Fetcher<Gatekeeper<Session>>, caller: GatekeeperCaller,
-      executionId?: string, holder?: SessionHolder): Promise<RpcStub<Session>> {
+      executionId?: string, holder?: SessionHolder, viewer?: GadgetViewer, viewerRequired = false)
+      : Promise<RpcStub<Session>> {
     this.assertGatekeeperUsable(id);
     let leave = holder && this.joinSession(holder);
     let queue = this.storage.gatekeepers.get(id)?.creationSpec?.type === "agentSpawner"
         ? new AgentSpawnerQueueImpl(this, id, caller, undefined, undefined, leave)
-        : new ApprovalQueueImpl(this, id, caller, undefined, executionId, leave);
+        : new ApprovalQueueImpl(
+            this, id, caller, undefined, executionId, leave, viewer, viewerRequired);
     // @ts-expect-error TODO: Remove annotation when Cap'n Web fixes cyclic type issues
     return facet.startSession(queue);
   }
@@ -9602,6 +9646,18 @@ class OverseerImpl implements AgentHooks {
         overseerId: this.ctx.id.toString(),
       };
 
+      // User-started and Gadget-started agent runs inherit the triggering user's isolated Gadget
+      // runtime and MCP account. For a Gadget-started run `initiator.id` is that user's profile
+      // (set server-side from the callback's initiator); without this a collaborator's run would
+      // fall through to the owner's account. Gadget code cannot choose or override it.
+      let viewer: GadgetViewer | undefined;
+      const viewerProfileId = agentViewerProfileId(initiator);
+      if (viewerProfileId !== undefined) {
+        const userId = this.users.idFromName(viewerProfileId).toString();
+        const runtimeKey = this.getObserverRuntimeKey(viewerProfileId, userId);
+        if (runtimeKey) viewer = {userId, profileId: viewerProfileId, runtimeKey};
+      }
+
       let workerDef: WorkerLoaderWorkerCode = {
         compatibilityDate: "2026-02-01",
         compatibilityFlags: [
@@ -9618,7 +9674,7 @@ class OverseerImpl implements AgentHooks {
           "agent.js": code,
         },
         // The agent's env holds the chat's named bindings (see getEnvForAgent).
-        env: this.getEnvForAgent(chatId, bindings, executionId),
+        env: this.getEnvForAgent(chatId, bindings, executionId, viewer),
         tails: [this.ctx.exports.CodeModeTailLoopback({props: tailProps})],
         globalOutbound: null,
       };
@@ -9641,7 +9697,7 @@ class OverseerImpl implements AgentHooks {
       try {
         // The forger is a transient stub argument, so the capability to forge persistent
         // gadget-restore stubs lives exactly as long as this run() call.
-        await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings));
+        await entrypoint.run(selfStub, new RestoreForgerImpl(this, chatId, bindings, viewer));
       } catch (err) {
         if (err instanceof Error && err.stack) {
           error = err.stack;
@@ -10420,6 +10476,30 @@ class OverseerImpl implements AgentHooks {
     }));
   }
 
+  /**
+   * The runtime keys a collaborator's Gadget runtimes may be filed under: their observer id, and
+   * the fallback key (see getObserverRuntimeKey) for one with no observer record.
+   */
+  #runtimeKeysOf(profileId: string): Set<string> {
+    let userId = this.users.idFromName(profileId).toString();
+    let keys = new Set([`user_${userId}`]);
+    let observer = this.storage.observers.get(profileId);
+    if (observer) keys.add(observer.observerId);
+    return keys;
+  }
+
+  /** Aborts and removes every user-scoped Gadget runtime filed under one of `runtimeKeys`. */
+  #removeObserverRuntimes(runtimeKeys: Set<string>): void {
+    for (let runtime of Array.from(this.storage.gadgetRuntimes.list())
+        .filter(item => runtimeKeys.has(item.runtimeKey))) {
+      this.ctx.facets.abort(runtime.facetName,
+          new Error("This collaborator's access to the Gadget was revoked."));
+      this.ctx.facets.delete(runtime.facetName);
+      this.#runningChatIds.delete(runtime.facetName);
+      this.storage.gadgetRuntimes.delete(runtime.facetName);
+    }
+  }
+
   // Tear down observer records for collaborators who lost access as a result of a sharing change.
   // For each affected collaborator who is now fully unauthorized (newAccess === null) and has an
   // observer record: best-effort removeObserver on all gatekeeper facets, then delete the record.
@@ -10431,6 +10511,7 @@ class OverseerImpl implements AgentHooks {
     for (let entry of affected) {
       if (entry.newAccess !== null) continue;  // narrowed but still has access -> keep record
       let observer = this.storage.observers.get(entry.profile.id);
+      this.#removeObserverRuntimes(this.#runtimeKeysOf(entry.profile.id));
       if (!observer) continue;
       this.storage.observers.delete(observer.profileId);
       await this.#removeObserverFromGatekeepers(observer.observerId, gatekeeperIds);
@@ -10442,6 +10523,19 @@ class OverseerImpl implements AgentHooks {
   // presentation-only role and their Outputs index, which may list gadgets they no longer hold.
   async refreshAffectedCollaboratorListings(affected: AffectedCollaborator[]): Promise<void> {
     if (!affected.length || this.storage.deleting.get()) return;
+    // A role downgrade must not leave a user-scoped Gadget actor running with its previous
+    // capabilities. Keep the observer/account choice, but force a fresh runtime on reconnect.
+    for (let entry of affected) {
+      let newRole = entry.newAccess?.role ?? null;
+      if (newRole === null || entry.oldAccess.role === newRole) continue;
+      let keys = this.#runtimeKeysOf(entry.profile.id);
+      for (let runtime of Array.from(this.storage.gadgetRuntimes.list())
+          .filter(item => keys.has(item.runtimeKey))) {
+        this.ctx.facets.abort(runtime.facetName,
+            new Error("Gadget runtime restarted after a collaborator role change."));
+        this.#runningChatIds.delete(runtime.facetName);
+      }
+    }
     // Persist in the sharing mutation's synchronous continuation, before a session restart or
     // gatekeeper teardown can interrupt it. Retries use this same source alarm after eviction.
     this.ctx.storage.transactionSync(() => {
@@ -10795,6 +10889,50 @@ class OverseerImpl implements AgentHooks {
     return this.observerLedger.observerScope(
         reach?.gadgetIds ?? "build", this.#inScopeGatekeepers(grant, reach));
   }
+
+  /** Returns a viewer-scoped runtime key without exposing it to Gadget code. */
+  getObserverRuntimeKey(profileId: string, userId: string): string | undefined {
+    if (userId === this.ownerId) return undefined;
+    return this.storage.observers.get(profileId)?.observerId ?? `user_${userId}`;
+  }
+
+  /** Resolve the authenticated viewer's already-verified account for one live Gadget binding. */
+  async getObserverVerifier(
+      gatekeeperId: number, caller: GatekeeperCaller,
+      viewer?: GadgetViewer, viewerRequired = false)
+      : Promise<Fetcher<GatekeeperUserVerifier> | null> {
+    if (caller.from !== "gadget" && caller.from !== "agent") return null;
+    if (!viewer) {
+      if (viewerRequired) throw new Error("This Gadget session is no longer authorized.");
+      return null;
+    }
+
+    // The viewer is sealed server-side, but a user id that is not the profile's own would resolve
+    // another user's accounts, so the pairing is checked rather than trusted.
+    if (viewer.userId !== this.users.idFromName(viewer.profileId).toString()) {
+      throw new Error("This Gadget session is no longer authorized.");
+    }
+
+    const record = this.storage.observers.get(viewer.profileId);
+    const effectiveAccess = (await this.getSharingManager()).getEffectiveAccess(viewer.profileId);
+    if (!record || !effectiveAccess || record.observerId !== viewer.runtimeKey) {
+      throw new Error("This Gadget session is no longer authorized.");
+    }
+
+    const accountId = record.accountChoices[gatekeeperId];
+    const gatekeeper = this.storage.gatekeepers.get(gatekeeperId);
+    const vendorId = gatekeeper?.creationSpec?.type === "gatekeeper"
+      ? gatekeeper.creationSpec.vendorId
+      : undefined;
+    if (accountId === undefined || !vendorId) {
+      throw new Error("This user has not configured an account for this binding.");
+    }
+
+    const user = this.users.get(this.users.idFromString(viewer.userId));
+    const verifier = await user.getVerifier(accountId, vendorId);
+    if (!verifier) throw new Error("The selected account is no longer connected.");
+    return verifier;
+  }
   // Render the observer verification failures as one line per binding, naming the connection and the
   // account that was refused: `<resourceTitle> (<account label>) — <reason>`. Cold path only (we're
   // about to deny the open), so the extra User DO round trip per failure is fine. Discloses nothing
@@ -10877,7 +11015,7 @@ class OverseerImpl implements AgentHooks {
   // executed code already holds.
   async forgeRestoreStubForBinding(
       chatId: number, bindings: Record<string, ChatBindingEntry>,
-      bindingName: string, params: unknown): Promise<unknown> {
+      bindingName: string, params: unknown, viewer?: GadgetViewer): Promise<unknown> {
     let entry = bindings[bindingName];
     if (!entry) {
       throw new Error(`No such binding: ${bindingName}`);
@@ -10898,7 +11036,10 @@ class OverseerImpl implements AgentHooks {
     let forger: Fetcher<RestoreForgerEntrypoint>;
     try {
       this.#codeIdMap.set(codeId, RESTORE_FORGER_WORKER);
-      forger = await this.ctx.restore({type: "gadget", gadgetId, codeId});
+      // A collaborator's run forges stubs against its own user-scoped runtime, never the shared one.
+      forger = await this.ctx.restore(
+          viewer ? {type: "gadget", gadgetId, codeId, runtime: viewer}
+                 : {type: "gadget", gadgetId, codeId});
     } finally {
       this.#codeIdMap.delete(codeId);
     }
@@ -10940,8 +11081,17 @@ class OverseerImpl implements AgentHooks {
         // is no default), this fails with an explicit error rather than silently retargeting.
         let gadgetId = this.resolveGadgetId(params.gadgetId);
         this.getGadgetRecord(gadgetId);  // validate it exists
+        // A user-scoped stub restores only while its collaborator is still set up to observe; a
+        // revoked or unknown runtime key must never fall back to the shared (owner) facet.
+        if (params.runtime) {
+          let observer = this.storage.observers.get(params.runtime.profileId);
+          let valid = observer
+              ? observer.observerId === params.runtime.runtimeKey
+              : params.runtime.runtimeKey === `user_${params.runtime.userId}`;
+          if (!valid) throw new Error("This Gadget session is no longer authorized.");
+        }
         return this.#getGadgetFacetRaw(
-            gadgetId, this.#resolveGadgetChatId(gadgetId, params.chatId));
+            gadgetId, this.#resolveGadgetChatId(gadgetId, params.chatId), params.runtime);
       }
 
       case "gatekeeper":
@@ -10976,6 +11126,10 @@ type OverseerRestoreParams = {
   // to the gadget -- the code that created the stub is the code that knows what to do with it.
   // Once the chat is committed, discarded or deleted, the same params resolve to main.
   chatId?: number;
+
+  // Present when the stub was minted for a collaborator's own user-scoped runtime of the gadget
+  // (see getGadgetFacetFetcher). Absent for the shared runtime.
+  runtime?: GadgetViewer;
 
   // A hack: If present, and if the code injection table currently contains this ID, then
   // instead of returning the gadget stub, [restore]() loads a dynamic worker.
@@ -11443,8 +11597,9 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   async startGatekeeperSession(
-      target: BindingLoopbackTarget, caller: GatekeeperCaller): Promise<any> {
-    return this.impl.startGatekeeperSession(target, caller);
+      target: BindingLoopbackTarget, caller: GatekeeperCaller, viewer?: GadgetViewer,
+      viewerRequired = false): Promise<any> {
+    return this.impl.startGatekeeperSession(target, caller, viewer, viewerRequired);
   }
 
   startGatekeeperHook(id: number): NativeRpcStub<RpcTarget> {
@@ -11518,6 +11673,13 @@ type GatekeeperLoopbackProps = {
   target: BindingLoopbackTarget;
 
   caller: GatekeeperCaller;
+
+  // Set when the binding belongs to a collaborator's user-scoped Gadget runtime.
+  viewer?: GadgetViewer;
+
+  // Kept independently from `viewer` so a loopback that loses the viewer fails closed instead of
+  // silently using the binding owner's account.
+  viewerRequired: boolean;
 };
 
 type BindingLoopbackTarget = {
@@ -11568,7 +11730,8 @@ export class GatekeeperLoopback extends WorkerEntrypoint<Cloudflare.Env, Gatekee
 
     // @ts-ignore: LSP-only RPC types bug, "type instantiation is excessively deep"
     let session = stub.startGatekeeperSession(
-        this.ctx.props.target, this.ctx.props.caller);
+        this.ctx.props.target, this.ctx.props.caller, this.ctx.props.viewer,
+        this.ctx.props.viewerRequired);
 
     return new Proxy(session, {
       get(target, prop, receiver) {
@@ -13770,6 +13933,13 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
   }
 
   async connectToGadget(chatId?: number): Promise<RpcStub<any>> {
+    const profile = await this.#clientUser.whoami();
+    const runtimeKey = this.impl.getObserverRuntimeKey(profile.id, this.#clientUser.id.toString());
+    const runtime = runtimeKey ? {
+      userId: this.#clientUser.id.toString(),
+      profileId: profile.id,
+      runtimeKey,
+    } : undefined;
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_interaction",
       user_id: this.#clientUser.id.toString(),
@@ -13778,7 +13948,7 @@ class GadgetClientImpl extends RpcTarget implements GadgetClient {
     });
     // The facet stub counts exactly as this capability does (joinedAs): it can outlive this
     // object, and it is the very stub a hook-enable widening's data flows through.
-    return this.impl.getGadgetFacet(this.id, chatId, this.joinedAs);
+    return this.impl.getGadgetFacet(this.id, chatId, this.joinedAs, runtime);
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
@@ -14051,6 +14221,13 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
       this.#deny();
     }
 
+    const profile = await this.#clientUser.whoami();
+    const runtimeKey = this.impl.getObserverRuntimeKey(profile.id, this.#clientUser.id.toString());
+    const runtime = runtimeKey ? {
+      userId: this.#clientUser.id.toString(),
+      profileId: profile.id,
+      runtimeKey,
+    } : undefined;
     this.impl.recordGadgetAnalytics({
       event_name: "gadget_interaction",
       user_id: this.#clientUser.id.toString(),
@@ -14058,7 +14235,8 @@ class UseGadgetClientInterface extends RpcTarget implements GadgetClient {
     });
     // The facet stub counts as a "use" session for its own lifetime, like this interface: it can
     // outlive this object, and it is the very stub a hook-enable widening's data flows through.
-    return this.impl.getGadgetFacet(this.id, undefined, {kind: "use", profileId: this.clientProfileId});
+    return this.impl.getGadgetFacet(
+        this.id, undefined, {kind: "use", profileId: this.clientProfileId}, runtime);
   }
 
   async getExportFormats(chatId?: number): Promise<GadgetExportFormat[]> {
@@ -14258,12 +14436,18 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   // gatekeeper releases its last reference to the queue (see openGatekeeperSession).
   constructor(protected impl: OverseerImpl, protected gatekeeperId: number,
               private caller: GatekeeperCaller, private hookId?: number,
-              private executionId?: string, private leaveSession?: () => void) {
+              private executionId?: string, private leaveSession?: () => void,
+              private viewer?: GadgetViewer, private viewerRequired = false) {
     super();
   }
 
   [Symbol.dispose]() {
     this.leaveSession?.();
+  }
+
+  getObserverVerifier(): Promise<Fetcher<GatekeeperUserVerifier> | null> {
+    return this.impl.getObserverVerifier(
+        this.gatekeeperId, this.caller, this.viewer, this.viewerRequired);
   }
 
   authorizeObservation(description: ObservationDescription): Promise<void> {

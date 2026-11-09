@@ -1364,6 +1364,14 @@ export interface SlashCommandProvider extends RpcTarget {
  * called before applying them.
  */
 export interface ApprovalQueue extends ObservationAuthorizer {
+  /**
+   * Returns the connected-account verifier chosen by the authenticated observer for this binding:
+   * the same capability `addObserver` receives for that observer. Account-specific gatekeepers may
+   * use it for observer-scoped requests. A missing result means this caller has no observer
+   * account (for example, the owner or an agent session).
+   */
+  getObserverVerifier?(): Promise<Fetcher<GatekeeperUserVerifier> | null>;
+
   // TODO: Method to indicate that the gadget tried to perform an action that the gatekeeper itself
   //   hasn't been authorized to do (e.g. the user hasn't authorized the right OAuth scopes). The
   //   system should direct the user to the right UI to authorize the action.

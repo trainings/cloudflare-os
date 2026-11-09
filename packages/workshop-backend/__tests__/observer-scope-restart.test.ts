@@ -29,6 +29,97 @@ const OWNER = "owner";
 const AGENT: AiChatAuthorInfo = { type: "agent", id: "some-model", name: "Agent" };
 const USER_META = { profile: { type: "user", id: OWNER, name: "Owner" } as AiChatAuthorInfo };
 
+describe("observer verifier loopbacks", () => {
+  it("fails closed when a collaborator loopback loses its viewer", () => withImpl(async impl => {
+    seedGatekeeper(impl, 1);
+    let facet = { startSession: async (queue: any) => queue.getObserverVerifier() };
+
+    // The owner uses the shared runtime, so no observer verifier is expected.
+    await expect(impl.openGatekeeperSession(
+        1, facet as any, {from: "gadget", gadgetId: 1})).resolves.toBeNull();
+
+    // A collaborator loopback retains this marker separately from the viewer identity. Losing the
+    // viewer then rejects session creation instead of silently taking the owner's MCP account.
+    await expect(impl.openGatekeeperSession(
+        1, facet as any, {from: "gadget", gadgetId: 1}, undefined, undefined, true))
+        .rejects.toThrow(/no longer authorized/);
+  }));
+
+  // A viewer's runtime may only ever resolve the account that same viewer chose: never another
+  // collaborator's, and never the workspace owner's.
+  describe("getObserverVerifier", () => {
+    const CALLER = {from: "gadget", gadgetId: 1} as const;
+
+    // Two collaborators with distinct accounts on gatekeeper 1; `asked` records every
+    // (user, accountId, vendorId) the kernel resolved a verifier for.
+    function seedCollaborators(impl: any, access: (profileId: string) => unknown = () => ({role: "use"})) {
+      seedGatekeeper(impl, 1);
+      impl.storage.observers.put({profileId: "alice", observerId: "obs-a", accountChoices: {1: 10}});
+      impl.storage.observers.put({profileId: "bob", observerId: "obs-b", accountChoices: {1: 20}});
+      impl.getSharingManager = async () => ({getEffectiveAccess: access});
+      let asked: Array<[string, number, string]> = [];
+      impl.users = {
+        idFromString: (id: string) => id,
+        idFromName: (name: string) => ({ toString: () => `${name}-user` }),
+        get: (userId: string) => ({
+          getVerifier: async (accountId: number, vendorId: string) => {
+            asked.push([userId, accountId, vendorId]);
+            return {};
+          },
+        }),
+      };
+      return asked;
+    }
+
+    const viewer = (name: "alice" | "bob", runtimeKey = name === "alice" ? "obs-a" : "obs-b") =>
+        ({userId: `${name}-user`, profileId: name, runtimeKey});
+
+    it("resolves the viewer's own chosen account", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl);
+      await impl.getObserverVerifier(1, CALLER, viewer("alice"), true);
+      await impl.getObserverVerifier(1, CALLER, viewer("bob"), true);
+      expect(asked).toEqual([
+        ["alice-user", 10, "testvendor"],
+        ["bob-user", 20, "testvendor"],
+      ]);
+    }));
+
+    it("refuses a runtime key that belongs to someone else", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl);
+      // Bob's profile presented with Alice's runtime (or the reverse) must not resolve anything.
+      await expect(impl.getObserverVerifier(1, CALLER, viewer("bob", "obs-a"), true))
+          .rejects.toThrow(/no longer authorized/);
+      await expect(impl.getObserverVerifier(1, CALLER, viewer("alice", "shared"), true))
+          .rejects.toThrow(/no longer authorized/);
+      expect(asked).toEqual([]);
+    }));
+
+    it("refuses a viewer whose user id is not their profile's own", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl);
+      // Bob's profile paired with Alice's user would resolve Alice's accounts.
+      await expect(impl.getObserverVerifier(
+          1, CALLER, { ...viewer("bob"), userId: "alice-user" }, true))
+          .rejects.toThrow(/no longer authorized/);
+      expect(asked).toEqual([]);
+    }));
+
+    it("refuses a viewer whose access has been revoked", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl, profileId => profileId === "bob" ? null : {role: "use"});
+      await expect(impl.getObserverVerifier(1, CALLER, viewer("bob"), true))
+          .rejects.toThrow(/no longer authorized/);
+      expect(asked).toEqual([]);
+    }));
+
+    it("refuses a viewer with no account chosen for the binding", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl);
+      seedGatekeeper(impl, 2);
+      await expect(impl.getObserverVerifier(2, CALLER, viewer("alice"), true))
+          .rejects.toThrow(/not configured an account/);
+      expect(asked).toEqual([]);
+    }));
+  });
+});
+
 let doCounter = 0;
 
 async function withImpl(
@@ -1178,7 +1269,9 @@ describe("gadget facet stubs count as sessions", () => {
       authorizeGadget: async () => true,
       getGadgetRecord: (id: number) => impl.getGadgetRecord(id),
       getGadgetFacet: (id: number, chatId?: number, joinAs?: string) =>
-          impl.getGadgetFacet(id, chatId, joinAs),
+        impl.getGadgetFacet(id, chatId, joinAs),
+      getObserverRuntimeKey: (profileId: string, userId: string) =>
+        impl.getObserverRuntimeKey(profileId, userId),
       recordGadgetAnalytics: () => {},
       users: { idFromString: (id: string) => id,
                get: () => ({
