@@ -7,6 +7,7 @@ import type {
   ApprovalQueue,
   Gatekeeper,
   GatekeeperUserVerifier,
+  ObserverAdmission,
   ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 
@@ -22,6 +23,7 @@ import {
   withClient,
   type ConnectionAccount,
   type ConnectionEnv,
+  type McpObserverAccount,
   type WithClientOptions,
 } from "./connection.js";
 import type { McpLog } from "./log.js";
@@ -30,7 +32,6 @@ import { formatToolScope, scopeAllows, type ToolScope } from "./scope.js";
 import { matchesToolQuery, toolQueryTerms, MAX_SEARCH_RESULTS } from "./tool-search.js";
 import { McpSessionBase, type McpSessionHost, type StoredAction } from "./session.js";
 import { installToolMethods } from "./session-methods.js";
-import { observerRefusalMessage } from "./sharing-policy.js";
 import {
   actionKindFor,
   classifyTool,
@@ -50,6 +51,27 @@ type SessionConstructor<Session extends McpSessionBase> = new (
 
 const MAX_CONCURRENT_DISCOVERIES = 4;
 const MAX_QUEUED_DISCOVERIES = 32;
+
+// The storage key under which `addObserver` remembers a "use" admission.
+function viewerObserverKey(observerId: string): string {
+  return `viewer-observer:${observerId}`;
+}
+
+function requireObserverAccount(value: unknown): McpObserverAccount {
+  if (!value || (typeof value !== "object" && typeof value !== "function")) {
+    throw new Error("This MCP account does not support observer-scoped sessions.");
+  }
+  const candidate = value as Partial<McpObserverAccount>;
+  if (typeof candidate.getAccountObjectId !== "function" ||
+      typeof candidate.verifyEndpoint !== "function" ||
+      typeof candidate.getConnection !== "function" ||
+      typeof candidate.assertConnectionCurrent !== "function" ||
+      typeof candidate.setMcpSessionId !== "function" ||
+      typeof candidate.noteCredentialsExpired !== "function") {
+    throw new Error("This MCP account does not support observer-scoped sessions.");
+  }
+  return candidate as McpObserverAccount;
+}
 
 /** Common session, catalog, action, and sharing behavior for connector-owned MCP facets. */
 export abstract class McpFacetBase<
@@ -80,14 +102,6 @@ export abstract class McpFacetBase<
 
   /** Namespace preventing approval policy from crossing resource boundaries. */
   protected abstract get actionScopeTag(): string;
-
-  /** Human-readable resource named when refusing an observer. */
-  protected abstract get observerName(): string;
-
-  /** Who may open a workspace reading through this facet, as a refusal names them. */
-  protected get observerOpeners(): string {
-    return "its owner";
-  }
 
   /** Connector-owned account capability used for endpoint calls. */
   protected abstract account(): ConnectionAccount;
@@ -232,27 +246,168 @@ export abstract class McpFacetBase<
 
   /** Starts a session with generated per-tool methods when the catalog is available. */
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<Session> {
+    const getObserverVerifier = approvalQueue.getObserverVerifier;
+    const observerVerifier = typeof getObserverVerifier === "function"
+      ? await getObserverVerifier()
+      : null;
+    let host: McpSessionHost = this;
+    let observerAccountId: string | undefined;
+    if (observerVerifier) {
+      const observerAccount = requireObserverAccount(observerVerifier);
+      await observerAccount.verifyEndpoint(this.endpoint);
+      observerAccountId = await observerAccount.getAccountObjectId();
+      host = this.#sessionHost(observerAccount, observerAccountId);
+    }
+
     let SessionClass = this.sessionClass;
     try {
-      SessionClass = installToolMethods(SessionClass, await this.tools());
+      const tools = await host.tools();
+      SessionClass = installToolMethods(SessionClass, tools);
     } catch (err) {
       this.log.warn("starting session without per-tool methods", {
         event: "session.tool-methods.unavailable", error: err,
       });
     }
-    return new SessionClass(this, approvalQueue.dup());
+    return new SessionClass(host, approvalQueue.dup());
   }
 
   /**
-   * Refuses every observer, so a binding can only be opened by its owner unless the connector
-   * overrides this to admit someone.
+   * Admits a collaborator. A "build" collaborator reads the workspace's chats, which hold whatever
+   * the binding's own account returned, so `admitWorkspaceObserver` decides and the default refuses.
+   * A "use" collaborator runs the Gadget in a runtime of their own with their own account, so it is
+   * enough that the account authenticates to this endpoint; what it may see is left to the MCP
+   * server. Absent, the admission is `"workspace"`.
    */
-  async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
-    throw new Error(observerRefusalMessage(this.observerName, this.observerOpeners));
+  async addObserver(
+      id: string, user: Fetcher<GatekeeperUserVerifier>,
+      admission: ObserverAdmission = "workspace"): Promise<void> {
+    if (admission === "workspace") {
+      this.ctx.storage.kv.delete(viewerObserverKey(id));
+      return this.admitWorkspaceObserver(user);
+    }
+    const observerAccount = requireObserverAccount(user);
+    await observerAccount.verifyEndpoint(this.endpoint);
+    // A successful tools/list proves the selected credentials are accepted by this MCP endpoint.
+    // The data plane later uses the same account capability for every call.
+    await withClient(this.env, observerAccount, this.endpoint, client => client.listTools(1));
+    this.ctx.storage.kv.put(viewerObserverKey(id), true);
   }
 
-  /** Removes nothing, since no observer state is kept. */
-  async removeObserver(_id: string): Promise<void> {}
+  /**
+   * Whether `user` may open the whole workspace. Refuses by default: an MCP result carries no
+   * per-record access check the Workshop could apply to what a chat already holds.
+   */
+  protected async admitWorkspaceObserver(_user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+    throw new Error(
+        "Collaborators with build access can't open a workspace that uses this MCP connection. " +
+        "Share the Gadget with them instead.");
+  }
+
+  /** Whether `id` was admitted to run a Gadget in a runtime of their own (see `addObserver`). */
+  protected isViewerObserver(id: string): boolean {
+    return this.ctx.storage.kv.get<boolean>(viewerObserverKey(id)) === true;
+  }
+
+  /** Forgets a "use" admission. */
+  async removeObserver(id: string): Promise<void> {
+    this.ctx.storage.kv.delete(viewerObserverKey(id));
+  }
+
+  // Catalog values per observer account, kept for this facet's lifetime so a collaborator's
+  // repeated sessions reuse a fresh catalog (the catalog's own TTL still applies) instead of each
+  // re-listing tools upstream. Never shared across accounts: what an account may see is its own.
+  #observerCatalogs = new Map<string, Map<string, unknown>>();
+
+  #observerCatalogValues(accountId: string | undefined): Map<string, unknown> {
+    if (accountId === undefined) return new Map();
+    let values = this.#observerCatalogs.get(accountId);
+    if (!values) {
+      // Bound the cache; the oldest account's entry is the cheapest to re-fetch.
+      if (this.#observerCatalogs.size >= 32) {
+        this.#observerCatalogs.delete(this.#observerCatalogs.keys().next().value!);
+      }
+      values = new Map();
+      this.#observerCatalogs.set(accountId, values);
+    }
+    return values;
+  }
+
+  /** Creates a per-session host so all discovery and tool traffic uses one user's credentials. */
+  #sessionHost(account: ConnectionAccount, observerAccountId?: string): McpSessionHost {
+    const catalogValues = this.#observerCatalogValues(observerAccountId);
+    const store = {
+      get: <T>(key: string) => catalogValues.get(key) as T | undefined,
+      put: <T>(key: string, value: T) => { catalogValues.set(key, value); },
+    };
+    const catalog = (deadline?: number) => scopedCatalog({
+      store,
+      log: this.log,
+      env: this.env,
+      account,
+      endpoint: this.endpoint,
+      scope: this.scope,
+      trust: this.trust,
+      deadline,
+    });
+    const call = <T>(fn: (client: McpClient) => Promise<T>, options?: WithClientOptions) =>
+      withClient(this.env, account, this.endpoint, fn, options);
+
+    return {
+      serverName: this.serverName,
+      endpoint: this.endpoint,
+      scope: this.scope,
+      observationSubresources: this.observationSubresources,
+      tools: async () => (await this.runDiscovery(deadline => catalog(deadline))).tools,
+      searchTools: async query => {
+        const terms = toolQueryTerms(query);
+        return this.runDiscovery(async deadline => {
+          const current = await catalog(deadline);
+          if (!current.truncated) {
+            return current.tools.filter(entry => matchesToolQuery(entry.tool, terms))
+              .slice(0, MAX_SEARCH_RESULTS);
+          }
+          const tools = await call(
+            client => client.listMatchingToolSummaries(
+              MAX_SEARCH_RESULTS,
+              tool => scopeAllows(this.scope, tool.name, current.isPortal) &&
+                matchesToolQuery(tool, terms),
+            ),
+            {deadline},
+          );
+          return tools.map(tool => classifyTool(tool, this.trust));
+        });
+      },
+      findTool: async name => this.runDiscovery(async deadline => {
+        if (!scopeAllows(this.scope, name, this.scope.serverId !== undefined)) return undefined;
+        const current = await catalog(deadline);
+        if (!scopeAllows(this.scope, name, current.isPortal)) return undefined;
+        const described = current.tools.find(entry => entry.tool.name === name);
+        if (described) return described;
+        if (!current.truncated) return undefined;
+        const tool = await call(client => client.findTool(name), {deadline});
+        return tool ? classifyTool(tool, this.trust) : undefined;
+      }),
+      call,
+      actionKindFor: name => actionKindFor(this.actionScopeTag, name),
+      stageAction: (name, args) => {
+        const staged = this.stageAction(name, args);
+        if (observerAccountId) {
+          this.ctx.storage.kv.put(`observer-action-account:${staged.id}`, observerAccountId);
+        }
+        return staged;
+      },
+      discardStagedAction: id => {
+        this.ctx.storage.kv.delete(`observer-action-account:${id}`);
+        this.discardStagedAction(id);
+      },
+      lookupAction: id => this.lookupAction(id),
+    };
+  }
+
+  /** Resolves a previously verified observer account id when an approved action is applied. */
+  protected accountForObserver(_accountObjectId: string): ConnectionAccount {
+    throw new Error("This MCP connector cannot resolve an observer account for an approved action.");
+  }
 
   /** Stages an MCP action for approval. */
   stageAction(toolName: string, args: Record<string, unknown>): StoredAction {
@@ -271,13 +426,20 @@ export abstract class McpFacetBase<
 
   /** Applies an approved action without retrying an outcome-unknown write. */
   async applyAction(action: number): Promise<void> {
+    const accountObjectId = this.ctx.storage.kv.get<string>(`observer-action-account:${action}`);
+    const account = accountObjectId ? this.accountForObserver(accountObjectId) : this.account();
     await this.#actions().apply(
-      action, fn => this.call(fn, { retryOnExpiry: false }), this.log);
+      action,
+      fn => withClient(this.env, account, this.endpoint, fn, {retryOnExpiry: false}),
+      this.log,
+    );
+    if (accountObjectId) this.ctx.storage.kv.delete(`observer-action-account:${action}`);
   }
 
   /** Rejects a pending action. */
   async rejectAction(action: number): Promise<void> {
     this.#actions().reject(action);
+    this.ctx.storage.kv.delete(`observer-action-account:${action}`);
   }
 
   /** Reports that MCP actions cannot be reverted. */

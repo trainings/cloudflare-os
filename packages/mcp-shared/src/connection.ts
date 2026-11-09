@@ -70,6 +70,14 @@ export type ConnectionAccount = {
   noteCredentialsExpired(endpoint: string, generation: number): Promise<void>;
 };
 
+/** Account capability supplied by an authenticated MCP observer for one binding session. */
+export interface McpObserverAccount extends ConnectionAccount {
+  /** Returns the account DO id so an approved write can later use the same user's credentials. */
+  getAccountObjectId(): Promise<string>;
+  /** Confirms this connected account is for the endpoint represented by the binding. */
+  verifyEndpoint(endpoint: string): Promise<void>;
+}
+
 /** The name this deployment gives when introducing itself to an MCP server. */
 export function clientName(env: ConnectionEnv): string {
   return env.MCP_CLIENT_NAME ?? "Gadgets";

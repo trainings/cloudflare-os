@@ -1,4 +1,4 @@
-import { expect, it, vi } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { McpFacetBase } from "../src/facet.js";
 import { McpSessionBase } from "../src/session.js";
@@ -6,7 +6,7 @@ import { classifyTool, type ServerTrust } from "../src/tools.js";
 import type { McpClient, McpTool } from "../src/client.js";
 import type { ToolScope } from "../src/scope.js";
 import type { ScopedCatalog } from "../src/catalog.js";
-import type { ConnectionAccount } from "../src/connection.js";
+import type { ConnectionAccount, McpObserverAccount } from "../src/connection.js";
 import type { ResourceDescription } from "@gadgets/workshop-shared/gatekeeper";
 
 const log = {
@@ -38,7 +38,6 @@ class TestFacet extends McpFacetBase<object, {
   protected get trust(): ServerTrust { return "byo"; }
   protected get sessionClass() { return TestSession; }
   protected get actionScopeTag() { return "test"; }
-  protected get observerName() { return "the test server"; }
   protected account(): ConnectionAccount { throw new Error("not used"); }
   get observationSubresources() { return undefined; }
   describe(): Promise<ResourceDescription> { throw new Error("not used"); }
@@ -66,23 +65,86 @@ class TestFacet extends McpFacetBase<object, {
     } as unknown as McpClient;
     return fn(client);
   }
+  viewerObserver(id: string): boolean { return this.isViewerObserver(id); }
   runDiscoveryTest<T>(operation: () => Promise<T>): Promise<T> {
     return this.runDiscovery(operation);
   }
 }
 
 function facet(scope: ToolScope = {}) {
+  const values = new Map<string, unknown>();
   const ctx = {
     props: { endpoint: "https://example.com/mcp", scope },
-    storage: { kv: {} },
+    storage: { kv: {
+      get: <T>(key: string) => values.get(key) as T | undefined,
+      put: <T>(key: string, value: T) => { values.set(key, value); },
+      delete: (key: string) => { values.delete(key); },
+    } },
   };
   return new TestFacet(ctx as never, {});
 }
 
 const queue = {
   dup() { return this; },
+  [Symbol.dispose]() {},
   authorizeObservation() {},
 };
+
+afterEach(() => vi.unstubAllGlobals());
+
+/** Answers an MCP endpoint's handshake and one `whoami` tool, recording what each request carried. */
+function stubMcpEndpoint() {
+  const requests: Array<{ method: string; authorization: string | null }> = [];
+  vi.stubGlobal("fetch", async (_input: unknown, init?: RequestInit) => {
+    const request = JSON.parse(String(init?.body));
+    requests.push({
+      method: request.method,
+      authorization: new Headers(init?.headers).get("Authorization"),
+    });
+    if (request.method === "notifications/initialized") return new Response(null, { status: 202 });
+    const result = request.method === "initialize"
+      ? { protocolVersion: "2025-03-26", capabilities: { tools: {} },
+          serverInfo: { name: "Test MCP", version: "1" } }
+      : request.method === "tools/list"
+        ? { tools: [{ name: "whoami", description: "Current account",
+            inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] }
+        : { content: [{ type: "text", text: "collaborator" }], isError: false };
+    return new Response(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }), {
+      headers: {
+        "Content-Type": "application/json",
+        ...(request.method === "initialize" ? { "Mcp-Session-Id": "test-session" } : {}),
+      },
+    });
+  });
+  return requests;
+}
+
+it("runs an observer session against the collaborator's MCP account", async () => {
+  const requests = stubMcpEndpoint();
+  const subject = facet();
+  const observerAccount: McpObserverAccount = {
+    async getAccountObjectId() { return "collaborator-account"; },
+    async verifyEndpoint(endpoint) { expect(endpoint).toBe("https://example.com/mcp"); },
+    async getConnection() {
+      return { authorization: "collaborator-token", sessionId: null, generation: 1 };
+    },
+    async assertConnectionCurrent() {},
+    async setMcpSessionId() { return true; },
+    async noteCredentialsExpired() {},
+  };
+  const observerQueue = {
+    ...queue,
+    getObserverVerifier: async () => observerAccount,
+  };
+
+  using session = await subject.startSession(observerQueue as never);
+  await expect(session.callTool("whoami")).resolves.toMatchObject({
+    status: "ok",
+    content: [{ type: "text", text: "collaborator" }],
+  });
+  expect(requests.map(request => request.method)).toContain("tools/call");
+  expect(requests.every(request => request.authorization === "Bearer collaborator-token")).toBe(true);
+});
 
 it("builds tool methods and falls back to the plain session when catalog loading fails", async () => {
   const subject = facet();
@@ -95,9 +157,41 @@ it("builds tool methods and falls back to the plain session when catalog loading
   expect(log.warnings).toContain("starting session without per-tool methods");
 });
 
-it("keeps facets owner-only using the connector's resource label", async () => {
-  await expect(facet().addObserver("observer", {} as never))
-    .rejects.toThrow(/test server.*only be opened by its owner/s);
+it("fails closed when an observer does not provide an MCP account capability", async () => {
+  await expect(facet().addObserver("observer", {} as never, "gadget"))
+    .rejects.toThrow(/does not support observer-scoped sessions/);
+});
+
+it("refuses to open the whole workspace to a collaborator, by default and when asked for", async () => {
+  const subject = facet();
+  await expect(subject.addObserver("observer", {} as never))
+    .rejects.toThrow(/can't open a workspace that uses this MCP connection/);
+  await expect(subject.addObserver("observer", {} as never, "workspace"))
+    .rejects.toThrow(/Share the Gadget with them instead/);
+});
+
+it("remembers a collaborator admitted to run the Gadget until they are removed or refused as build", async () => {
+  const subject = facet();
+  const account = {
+    getAccountObjectId: async () => "account-1",
+    verifyEndpoint: async () => {},
+    getConnection: async () => ({ authorization: "token", sessionId: null, generation: 1 }),
+    assertConnectionCurrent: async () => {},
+    setMcpSessionId: async () => true,
+    noteCredentialsExpired: async () => {},
+  } as never;
+  stubMcpEndpoint();
+  const admit = () => subject.addObserver("observer", account, "gadget");
+
+  await admit();
+  expect(subject.viewerObserver("observer")).toBe(true);
+
+  await subject.removeObserver("observer");
+  expect(subject.viewerObserver("observer")).toBe(false);
+
+  await admit();
+  await expect(subject.addObserver("observer", account, "workspace")).rejects.toThrow();
+  expect(subject.viewerObserver("observer")).toBe(false);
 });
 
 it("discovers and resolves tools beyond the initially described catalog", async () => {
