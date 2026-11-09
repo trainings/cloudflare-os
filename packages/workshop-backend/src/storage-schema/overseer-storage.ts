@@ -493,6 +493,12 @@ export type ActionRecord = {
   id: number,
   gatekeeperId: WorkpieceId;
   caller: GatekeeperCaller;
+  /**
+   * Profile of the collaborator whose user-scoped Gadget runtime submitted this action, when it
+   * ran with that collaborator's own connected account. Only that collaborator may see or resolve
+   * it (see observer-actions.ts).
+   */
+  observerProfileId?: string;
   resourceTitle?: string;   // denormalized to avoid gatekeeper query
   resourceUrl?: string;     // denormalized to avoid gatekeeper query
   createdAt: Date;

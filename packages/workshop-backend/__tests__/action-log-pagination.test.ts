@@ -169,6 +169,23 @@ describe("listActions", () => {
     expect(page.nextBeforeId).toBeUndefined();
   });
 
+  it("fills the page past a run of a collaborator's own actions it must hide", async () => {
+    let storage = makeActionStorage();
+    for (let id = 0; id < 5; id++) putAction(storage, id, { state: "approved" });
+    // A burst of the collaborator's observer actions, newer than every workspace action.
+    for (let id = 5; id < 70; id++) {
+      putAction(storage, id, { state: "approved" });
+      let record = storage.actions.get(id)!;
+      storage.actions.put({ ...record, observerProfileId: "collaborator" });
+    }
+    let client = await openFakeOverseer(storage);
+
+    // Hiding them must not leave an empty first page that still claims older history.
+    let page = await client.listActions();
+    expect(page.entries.map(e => e.id)).toEqual([4, 3, 2, 1, 0]);
+    expect(page.nextBeforeId).toBeUndefined();
+  });
+
   it("reports a stored description that predates the verdict as not auto-approvable", async () => {
     let storage = makeActionStorage();
     storage.actions.put({

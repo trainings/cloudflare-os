@@ -1,7 +1,10 @@
+import { useState } from 'react'
 import { Link } from '@tanstack/react-router'
-import { Hexagon } from '@phosphor-icons/react'
+import { Check, Hexagon, WarningCircle, X } from '@phosphor-icons/react'
 import { FormatGlyph } from './components/format/FormatVisuals'
 import { RpcStub } from 'capnweb'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import {
   AuthenticatedApi,
   Overseer,
@@ -17,6 +20,7 @@ import { GadgetPresence } from './components/GadgetPresence'
 import TopBarNotice from './TopBarNotice'
 import SiteLogo from './components/SiteLogo'
 import GadgetExportMenu from './GadgetExportMenu'
+import { useActions } from './useActions'
 
 // The minimal, "use"-only experience: a shared top bar plus the gadget's deployed UI, and nothing
 // else. Collaborators with the "use" role may only render and interact with the gadget's mainline
@@ -25,7 +29,7 @@ import GadgetExportMenu from './GadgetExportMenu'
 // overseer and gadget passed in here are the restricted capabilities returned by openWorkspace() for
 // "use" sessions; calling anything outside getMetadata()/subscribeToMetadata()/subscribeToPresence()/
 // subscribeToWorkpieces()/getGadget() (and, on the gadget, UI connection and export methods)
-// would throw.
+// would throw, apart from listing, approving and rejecting the writes this user initiated.
 //
 // When the workspace has more than one gadget, a simple picker in the top bar switches between
 // them (selection is owned by the parent, in the URL's `?w=` search param). Pending gadgets are
@@ -151,6 +155,7 @@ export default function GadgetUseView({
           ))}
         </div>
       )}
+      <PendingObserverActions overseer={overseer} />
 
       {/* ═══ GADGET UI ══════════════════════════════════════════════════════════ */}
       <div className="flex-1 min-h-0 overflow-hidden">
@@ -178,5 +183,82 @@ export default function GadgetUseView({
         )}
       </div>
     </div>
+  )
+}
+
+function PendingObserverActions({ overseer }: { overseer: RpcStub<Overseer> }) {
+  // For a "use" collaborator the server scopes this list to the actions submitted through their
+  // own session, so everything shown here will be sent with their own connected account.
+  const { pending: pendingEntries } = useActions(overseer)
+  const [processing, setProcessing] = useState<Set<number>>(() => new Set())
+  const [error, setError] = useState<string | null>(null)
+  const pending = pendingEntries.filter(action => action.type === 'action')
+
+  async function resolve(id: number, approve: boolean) {
+    setProcessing(current => new Set(current).add(id))
+    setError(null)
+    try {
+      if (approve) await overseer.approveAction(id)
+      else await overseer.rejectAction(id)
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : 'Could not resolve the action.')
+    } finally {
+      setProcessing(current => {
+        const next = new Set(current)
+        next.delete(id)
+        return next
+      })
+    }
+  }
+
+  if (pending.length === 0 && !error) return null
+  return (
+    <section aria-label="Pending actions" aria-live="polite" className="bg-kumo-base px-4 py-3 sm:px-6">
+      {pending.map(action => action.type === 'action' && (
+        <article key={action.id} aria-busy={processing.has(action.id)} className="mx-auto max-w-5xl overflow-hidden rounded-xl border border-amber-300 bg-kumo-base shadow-sm">
+          <div className="flex gap-3 px-4 py-4 sm:px-5">
+            <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-800">
+              <WarningCircle size={21} weight="fill" aria-hidden="true" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                <h2 className="text-sm font-semibold text-kumo-default">Action requires your approval</h2>
+                <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-900">Review before sending</span>
+              </div>
+              <p className="mt-1 text-sm font-medium text-kumo-default">{action.description.title}</p>
+              <p className="mt-1 text-xs text-kumo-subtle">Nothing has been sent yet. Review the request, then choose whether to allow it.</p>
+              <div className="mt-3 max-h-56 overflow-auto rounded-lg border border-kumo-line bg-kumo-tint px-3 py-2 text-sm leading-6 text-kumo-default [overflow-wrap:anywhere] [&_blockquote]:my-2 [&_blockquote]:border-l-2 [&_blockquote]:border-kumo-line [&_blockquote]:pl-3 [&_code]:rounded [&_code]:bg-kumo-base [&_code]:px-1 [&_code]:py-0.5 [&_li]:ml-5 [&_ol]:my-2 [&_ol]:list-decimal [&_p]:my-1.5 [&_pre]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-kumo-base [&_pre]:p-3 [&_ul]:my-2 [&_ul]:list-disc">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{action.description.description}</ReactMarkdown>
+              </div>
+              {error && <p role="alert" className="mt-2 text-xs text-kumo-danger">{error}</p>}
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-kumo-line pt-3">
+                <p className="text-xs text-kumo-subtle">This request will use your connected account.</p>
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={processing.has(action.id)}
+                    onClick={() => void resolve(action.id, false)}
+                    className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-kumo-line px-3 text-sm font-medium text-kumo-subtle transition hover:bg-kumo-tint hover:text-kumo-default disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <X size={16} aria-hidden="true" />
+                    Reject
+                  </button>
+                  <button
+                    type="button"
+                    disabled={processing.has(action.id)}
+                    onClick={() => void resolve(action.id, true)}
+                    className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-kumo-brand px-3.5 text-sm font-semibold text-kumo-inverse transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Check size={16} aria-hidden="true" />
+                    Approve action
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </article>
+      ))}
+      {pending.length === 0 && error && <p role="alert" className="mx-auto max-w-5xl text-xs text-kumo-danger">{error}</p>}
+    </section>
   )
 }

@@ -66,7 +66,9 @@ import {
   releasesMergedBy, type Release,
 } from "./blueprint-release";
 import { EMPTY_TREE_OID, gitObjectOid, parseGitCommitRefs } from "./git-codec";
-import { agentViewerProfileId } from "./observer-actions";
+import {
+  agentViewerProfileId, assertWorkspaceClientMayResolve, isVisibleToWorkspaceClient,
+} from "./observer-actions";
 import {
   listFeaturedBlueprintsFromKv, readBlueprintKvRecord, type BlueprintKvRecord,
 } from "./storage-schema/blueprints-kv";
@@ -697,6 +699,45 @@ export const ACTION_REPLAY_PAGE_SIZE = 256;
 
 /** listActions() entries returned per page. Exported for tests. */
 export const ACTION_HISTORY_PAGE_DEFAULT_LIMIT = 50;
+
+/**
+ * Pages the action log newest-first through `visible`: full pages, so a run of records the caller
+ * may not see never yields an empty page that still claims an older one exists. It reads (off the
+ * collection for "all", off byHistoryFilter otherwise) in windows of a page plus the one record
+ * that probes for an older page, and stops once the page is full, so the work is O(page) when most
+ * records are visible and otherwise only as long as the hidden run between visible ones.
+ */
+function pageActionLog(
+    actions: OverseerStorage["actions"],
+    options: {beforeId?: number, filter?: ActionHistoryFilter} | undefined,
+    visible: (record: ActionRecord) => boolean): ActionHistoryPage {
+  let {beforeId, filter = "all"} = options ?? {};
+  if (beforeId !== undefined && (!Number.isSafeInteger(beforeId) || beforeId < 0)) {
+    throw new TypeError(`Invalid beforeId: ${beforeId}`);
+  }
+  const window = ACTION_HISTORY_PAGE_DEFAULT_LIMIT + 1;
+  let page: ActionRecord[] = [];
+  let more = false;
+  for (let end = beforeId; !more;) {
+    let range = {end, reverse: true, limit: window};
+    let records = [...(filter === "all"
+        ? actions.list(range) : actions.byHistoryFilter.get(filter, range))];
+    for (let record of records) {
+      if (!visible(record)) continue;
+      if (page.length === ACTION_HISTORY_PAGE_DEFAULT_LIMIT) {
+        more = true;
+        break;
+      }
+      page.push(record);
+    }
+    if (records.length < window) break;
+    end = records.at(-1)!.id;
+  }
+  return {
+    entries: page.map(actionRecordToLog),
+    nextBeforeId: more ? page.at(-1)!.id : undefined,
+  };
+}
 
 /**
  * Keeps `commandPosition` only if it's a real index into `args`. Anything else becomes undefined,
@@ -5783,7 +5824,7 @@ class OverseerImpl implements AgentHooks {
   // observer verification has awaited.
   async authorizeObservation(gatekeeperId: number, description: ObservationDescription,
                              caller: GatekeeperCaller, executionId?: string,
-                             hookId?: number): Promise<void> {
+                             hookId?: number, viewer?: GadgetViewer): Promise<void> {
     // Forward exclusion: the gatekeeper may name observers who must not see this observation. Since
     // v1 has no per-thread hiding, the only way to let such an observation proceed is if no named
     // observer could reach it -- either they have lost access in the sharing graph, or this
@@ -5829,6 +5870,9 @@ class OverseerImpl implements AgentHooks {
           id: actionId,
           gatekeeperId,
           caller,
+          // What a collaborator's own runtime read, and with which tool and arguments, is theirs
+          // to see, like their actions (see observer-actions.ts).
+          ...(viewer ? {observerProfileId: viewer.profileId} : {}),
           resourceTitle: gatekeeper?.resourceTitle,
           resourceUrl: gatekeeper?.resourceUrl,
           createdAt: new Date(),
@@ -6402,7 +6446,8 @@ class OverseerImpl implements AgentHooks {
   }
 
   async submitAction(gatekeeperId: number, action: number | "create",
-                     description: ActionDescription, caller: GatekeeperCaller)
+                     description: ActionDescription, caller: GatekeeperCaller,
+                     viewer?: GadgetViewer)
       : Promise<void> {
     // An in-flight facet RPC can outlive removeGatekeeper, and a pending action on a removed
     // connection could never be approved or rejected (both dereference the facet).
@@ -6441,6 +6486,7 @@ class OverseerImpl implements AgentHooks {
       id: actionId,
       gatekeeperId,
       caller,
+      ...(viewer ? {observerProfileId: viewer.profileId} : {}),
       resourceTitle: gatekeeper.resourceTitle,
       resourceUrl: gatekeeper.resourceUrl,
       action,
@@ -6479,6 +6525,79 @@ class OverseerImpl implements AgentHooks {
     if (willAutoApprove) {
       this.ctx.waitUntil(this.drainAutoApprovals(gatekeeperId));
     }
+  }
+
+  // A "use" collaborator's view of the action log: only the actions submitted through their own
+  // observer-backed Gadget UI.
+  listObserverActions(profileId: string, options?: {beforeId?: number, filter?: ActionHistoryFilter})
+      : ActionHistoryPage {
+    return pageActionLog(
+        this.storage.actions, options, record => record.observerProfileId === profileId);
+  }
+
+  // Live deltas for a collaborator's own observer actions; nothing else is ever delivered.
+  subscribeToObserverActions(profileId: string, subscriber: RpcStub<ActionsSubscriber>)
+      : RpcStub<{}> {
+    let actions = this.storage.actions;
+    subscriber = subscriber.dup();
+    let subscribed = false;
+    let disposed = false;
+    subscriber.onRpcBroken(_ => unsubscribe());
+    let send = (record: ActionRecord) => {
+      if (record.observerProfileId === profileId) {
+        subscriber.entry(actionRecordToLog(record)).catch(unsubscribe);
+      }
+    };
+    let dbSubscriber = {
+      add: send,
+      update: (_oldRecord: ActionRecord, newRecord: ActionRecord) => send(newRecord),
+      remove: (_record: ActionRecord) => {},
+    };
+    function unsubscribe() {
+      if (disposed) return;
+      disposed = true;
+      if (subscribed) actions.unsubscribe(dbSubscriber);
+      subscriber[Symbol.dispose]();
+    }
+    actions.subscribe(dbSubscriber);
+    subscribed = true;
+    if (!disposed) subscriber.ready().catch(unsubscribe);
+    // @ts-expect-error Bugs in native RPC types make this not work currently.
+    return new NativeRpcStub<{}>({[Symbol.dispose]: unsubscribe});
+  }
+
+  // Approve or reject an observer action on behalf of the collaborator who originated it. Anyone
+  // else is refused: the write is applied with that collaborator's own connected account.
+  async resolveObserverAction(id: number, profileId: string, resolvedBy: AiChatAuthorInfo,
+                              approve: boolean): Promise<void> {
+    let action = this.storage.actions.get(id);
+    // "create" resolves a connection the collaborator cannot have requested.
+    if (!action || action.type !== "action" || action.action === "create" ||
+        action.state !== "pending" || action.observerProfileId !== profileId) {
+      throw new Error("This action is not pending for the current collaborator.");
+    }
+
+    if (approve) {
+      await this.applyPendingAction(action, resolvedBy, false);
+      this.ctx.waitUntil(this.drainAutoApprovals(action.gatekeeperId));
+      return;
+    }
+
+    let gatekeeper = await this.getGatekeeperFacet(action.gatekeeperId);
+    await gatekeeper.rejectAction(action.action);
+    action.state = "rejected";
+    action.appliedAt = new Date();
+    action.resolvedBy = resolvedBy;
+    this.storage.transaction(() => {
+      this.gitCache.clearPushMarks(action.id);
+      this.storage.actions.put(action);
+    });
+    this.traceAgentActionApproval(action, "denied");
+    // A collaborator's agent run waits on this decision; deny ends its turn, as for the owner.
+    if (action.caller.from === "agent") {
+      this.resumeAgentAfterDecision(action.caller.chatId, action.id);
+    }
+    this.ctx.waitUntil(this.drainAutoApprovals(action.gatekeeperId));
   }
 
   async bindHook<Hook extends RpcTarget>(
@@ -12455,24 +12574,10 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
 
   async listActions(options?: {beforeId?: number, filter?: ActionHistoryFilter})
       : Promise<ActionHistoryPage> {
-    let {beforeId, filter = "all"} = options ?? {};
-    if (beforeId !== undefined && (!Number.isSafeInteger(beforeId) || beforeId < 0)) {
-      throw new TypeError(`Invalid beforeId: ${beforeId}`);
-    }
-
-    // One ranged read -- off the collection itself for "all" (already id-ordered), off
-    // byHistoryFilter otherwise -- so the work is O(page) however sparse the matches. Pages are
-    // full until the last; the +1 record probes whether an older page exists.
-    let actions = this.impl.storage.actions;
-    let range = {end: beforeId, reverse: true, limit: ACTION_HISTORY_PAGE_DEFAULT_LIMIT + 1};
-    let page = [...(filter === "all"
-        ? actions.list(range) : actions.byHistoryFilter.get(filter, range))];
-    let more = page.length > ACTION_HISTORY_PAGE_DEFAULT_LIMIT;
-    if (more) page.pop();
-    return {
-      entries: page.map(actionRecordToLog),
-      nextBeforeId: more ? page.at(-1)!.id : undefined,
-    };
+    // A collaborator's own observer actions are not this client's to see (see
+    // isVisibleToWorkspaceClient); the scan skips them rather than paging past empty results.
+    return pageActionLog(this.impl.storage.actions, options,
+        record => isVisibleToWorkspaceClient(record, this.clientProfileId));
   }
 
   async approveAction(id: number, creation?: CreationApproval): Promise<void> {
@@ -12480,6 +12585,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (!action) {
       throw new Error(`No such action: ${id}`);
     }
+    assertWorkspaceClientMayResolve(action, this.clientProfileId);
 
     if (action.type === "bindHook") {
       throw new Error("Hooks should be enabled/disabled, not approved/rejected.");
@@ -12614,6 +12720,7 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     if (!action) {
       throw new Error(`No such action: ${id}`);
     }
+    assertWorkspaceClientMayResolve(action, this.clientProfileId);
 
     if (action.state !== "pending") {
       throw new Error(`Action is not pending: ${id}`);
@@ -12845,11 +12952,14 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     let disposed = false;
     subscriber.onRpcBroken(_ => unsubscribe());
 
+    let clientProfileId = this.clientProfileId;
     let dbSubscriber = {
       add(record: ActionRecord) {
+        if (!isVisibleToWorkspaceClient(record, clientProfileId)) return;
         subscriber.entry(actionRecordToLog(record)).catch(unsubscribe);
       },
       update(_oldRecord: ActionRecord, newRecord: ActionRecord): void {
+        if (!isVisibleToWorkspaceClient(newRecord, clientProfileId)) return;
         subscriber.entry(actionRecordToLog(newRecord)).catch(unsubscribe);
       },
       remove(_record: ActionRecord): void {
@@ -12888,7 +12998,9 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
             if (disposed) throw new Error("Action subscriber failed during replay");
             let page = [...actions.byLastChanged.list(
                 {...from, end, limit: ACTION_REPLAY_PAGE_SIZE})];
-            await Promise.all(page.map(record => subscriber.entry(actionRecordToLog(record))));
+            await Promise.all(page
+                .filter(record => isVisibleToWorkspaceClient(record, clientProfileId))
+                .map(record => subscriber.entry(actionRecordToLog(record))));
             if (page.length < ACTION_REPLAY_PAGE_SIZE) break;
             from = {startAfter: actionLastChangedKey(page.at(-1)!)};
           }
@@ -13765,14 +13877,21 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   async newAgentSpawnerGatekeeper(_config: AgentSpawnerConfig): Promise<GatekeeperClient<any>> {
     this.#deny();
   }
-  // Pending actions are queried eagerly for the badge; resolved history is demand-loaded. Return
-  // an empty terminal page so this speculative read does not fail for "use" collaborators.
-  async listActions(_options?: {beforeId?: number, filter?: ActionHistoryFilter})
+  // A "use" collaborator sees and resolves only the actions submitted through their own
+  // observer-backed Gadget UI -- those run with their own connected account. Everything else in
+  // the workspace's action log stays hidden.
+  async listActions(options?: {beforeId?: number, filter?: ActionHistoryFilter})
       : Promise<ActionHistoryPage> {
-    return {entries: []};
+    return this.impl.listObserverActions(this.clientProfileId, options);
   }
-  async approveAction(_id: number): Promise<void> { this.#deny(); }
-  async rejectAction(_id: number): Promise<void> { this.#deny(); }
+  async approveAction(id: number): Promise<void> {
+    await this.impl.resolveObserverAction(id, this.clientProfileId,
+        await this.#clientUser.whoami(), true);
+  }
+  async rejectAction(id: number): Promise<void> {
+    await this.impl.resolveObserverAction(id, this.clientProfileId,
+        await this.#clientUser.whoami(), false);
+  }
   async listHooks(): Promise<BoundHookInfo[]> { this.#deny(); }
   async enableHook(_id: number): Promise<void> { this.#deny(); }
   async disableHook(_id: number): Promise<void> { this.#deny(); }
@@ -13790,16 +13909,10 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   async denyWebFetchRequest(_requestId: string): Promise<void> { this.#deny(); }
   async subscribeToActions(
       subscriber: RpcStub<ActionsSubscriber>, _startAfter?: Date): Promise<RpcStub<{}>> {
-    // Inert: "use" sessions have no visibility into the action log. Signal a settled, empty log
-    // (so the client doesn't sit in a perpetual "loading" state) and never deliver entries.
-    let sub = subscriber.dup();
-    sub.ready().catch(() => {});
-    // @ts-expect-error Bugs in native RPC types make this not work currently.
-    return this.#subscriptionLease(new NativeRpcStub<{}>({
-      [Symbol.dispose]() {
-        sub[Symbol.dispose]();
-      }
-    }));
+    // Live deltas only, and only for this collaborator's own observer actions; clients read the
+    // current state through listActions() after subscribing (see api.ts).
+    return this.#subscriptionLease(
+        this.impl.subscribeToObserverActions(this.clientProfileId, subscriber));
   }
   async markChatRead(_chatId: number, _throughSequence?: number): Promise<void> { this.#deny(); }
   async markChatUnread(_chatId: number, _fromSequence?: number): Promise<boolean> { this.#deny(); }
@@ -14454,7 +14567,7 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
   authorizeObservation(description: ObservationDescription): Promise<void> {
     if (this.hookId !== undefined) requireLiveHook(this.impl, this.hookId);
     return this.impl.authorizeObservation(
-        this.gatekeeperId, description, this.caller, this.executionId, this.hookId);
+        this.gatekeeperId, description, this.caller, this.executionId, this.hookId, this.viewer);
   }
 
   async getGitCache(): Promise<GitCache> {
@@ -14463,7 +14576,7 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
 
   submitAction(action: number, description: ActionDescription): Promise<void> {
     if (this.hookId !== undefined) requireLiveHook(this.impl, this.hookId);
-    return this.impl.submitAction(this.gatekeeperId, action, description, this.caller);
+    return this.impl.submitAction(this.gatekeeperId, action, description, this.caller, this.viewer);
   }
 
   bindHook<Hook extends RpcTarget>(

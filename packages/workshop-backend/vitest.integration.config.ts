@@ -39,8 +39,19 @@ export default defineConfig({
       // held across the abort (e.g. the fire-and-forget AdminSettings install kicked off by the
       // fetch handler) reject on their own schedule, independent of any awaited call.
       if (error.message?.includes("abortAllDurableObjects")) return false;
+      // observer-actions.test.ts asserts that owner/build/use sessions are refused when resolving
+      // another collaborator's action; capnweb also reports those rejections independently.
+      if (error.message?.includes("must be resolved there.") ||
+          error.message?.includes("is not pending for the current collaborator")) {
+        return false;
+      }
       // Same, for the test that aborts only the user DO (state.abort with this reason).
       if (error.message?.includes("user-DO reset injected by test")) return false;
+      // Revoking a collaborator aborts the workspace DO. In this local pool, a callback held by
+      // the same WebSocket can then reject after the test's execution context has already ended.
+      if (error.message?.includes("execution context which hosts this callback is no longer running")) {
+        return false;
+      }
     },
   },
 });

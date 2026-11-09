@@ -45,6 +45,18 @@ describe("observer verifier loopbacks", () => {
         .rejects.toThrow(/no longer authorized/);
   }));
 
+  it("tags an observation made by a collaborator's runtime with their profile", () => withImpl(async impl => {
+    seedGatekeeper(impl, 1);
+    let read = {title: "Search", description: "Searched issues."};
+    let viewer = {userId: "alice-user", profileId: "alice", runtimeKey: "obs-a"};
+
+    await impl.authorizeObservation(1, read, {from: "gadget", gadgetId: 1}, undefined, undefined, viewer);
+    await impl.authorizeObservation(1, read, {from: "gadget", gadgetId: 1});
+
+    let records = [...impl.storage.actions.list()].filter((r: any) => r.type === "observation");
+    expect(records.map((r: any) => r.observerProfileId)).toEqual(["alice", undefined]);
+  }));
+
   // A viewer's runtime may only ever resolve the account that same viewer chose: never another
   // collaborator's, and never the workspace owner's.
   describe("getObserverVerifier", () => {
