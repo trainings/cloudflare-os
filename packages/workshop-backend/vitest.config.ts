@@ -59,6 +59,51 @@ export default {
 };
 `
 
+// A gatekeeper as its own Worker, as in production: a facet that makes the calls an MCP facet makes
+// on a collaborator's account verifier, and that verifier. The approval queue the facet is handed,
+// and what the queue returns, then cross a real Worker-to-Worker RPC boundary, which a facet in the
+// test's own isolate never exercises (observer-scope-restart.test.ts).
+const observerProbe = `
+import { WorkerEntrypoint } from "cloudflare:workers";
+const ENDPOINT = "https://example.com/mcp";
+const GENERATION = 3;
+function expectCall(endpoint, generation) {
+  if (endpoint !== ENDPOINT || (generation !== undefined && generation !== GENERATION)) {
+    throw new Error("unexpected arguments: " + endpoint + " " + generation);
+  }
+}
+export class FakeMcpVerifier extends WorkerEntrypoint {
+  async getAccountObjectId() { return "account-alice"; }
+  async verifyEndpoint(endpoint) { expectCall(endpoint); }
+  async getConnection(endpoint) {
+    expectCall(endpoint);
+    return { authorization: "Bearer " + endpoint, sessionId: null, generation: GENERATION };
+  }
+  async assertConnectionCurrent(endpoint, generation) { expectCall(endpoint, generation); }
+  async setMcpSessionId(endpoint, generation, previous, next) {
+    expectCall(endpoint, generation);
+    return previous === null && next === "session-1";
+  }
+  async noteCredentialsExpired(endpoint, generation) { expectCall(endpoint, generation); }
+}
+export class ProbeFacet extends WorkerEntrypoint {
+  async startSession(queue) {
+    const verifier = await queue.getObserverVerifier();
+    return {
+      accountId: await verifier.getAccountObjectId(),
+      connection: await verifier.getConnection(ENDPOINT),
+      stored: await verifier.setMcpSessionId(ENDPOINT, GENERATION, null, "session-1"),
+      checks: [
+        await verifier.verifyEndpoint(ENDPOINT),
+        await verifier.assertConnectionCurrent(ENDPOINT, GENERATION),
+        await verifier.noteCredentialsExpired(ENDPOINT, GENERATION),
+      ],
+    };
+  }
+}
+export default { fetch() { return new Response("observer probe"); } };
+`
+
 /**
  * Tests run inside workerd (via `@cloudflare/vitest-plugin`) so they exercise the same runtime APIs as
  * production -- e.g. Uint8Array.toHex/fromHex and crypto.subtle used by the sharing module. Most
@@ -77,8 +122,17 @@ export default defineConfig({
         // `allow_irrevocable_stub_storage` as in cloudflare.config.ts: the user DO persists account stubs.
         compatibilityFlags: ['experimental', 'nodejs_compat', 'allow_irrevocable_stub_storage'],
         streamingTails: ['span-recorder'],
-        serviceBindings: { SPAN_RECORDER: { name: 'span-recorder', entrypoint: 'SpanRecorder' } },
+        serviceBindings: {
+          SPAN_RECORDER: { name: 'span-recorder', entrypoint: 'SpanRecorder' },
+          TEST_MCP_VERIFIER: { name: 'observer-probe', entrypoint: 'FakeMcpVerifier' },
+          TEST_PROBE_FACET: { name: 'observer-probe', entrypoint: 'ProbeFacet' },
+        },
         workers: [{
+          name: 'observer-probe',
+          modules: true,
+          script: observerProbe,
+          compatibilityDate: COMPATIBILITY_DATE,
+        }, {
           name: 'span-recorder',
           modules: true,
           script: spanRecorder,

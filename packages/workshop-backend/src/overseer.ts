@@ -61,6 +61,7 @@ import type { WorktreeGitPullHints, WorktreeReplicator } from "@gadgets/workshop
 import { worktreeGitPull } from "./worktree-git";
 import { WorktreeReplicas, WorktreeReplicatorImpl } from "./worktree-replica";
 import { SessionWatchers, type SessionEnd } from "./session-watchers";
+import { ObserverVerifierAdapter } from "./observer-verifier-adapter";
 import { GadgetExportsImpl } from "./exports-session";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
@@ -11688,7 +11689,7 @@ class OverseerImpl implements AgentHooks {
   async getObserverVerifier(
       gatekeeperId: number, caller: GatekeeperCaller,
       viewer?: GadgetViewer, viewerRequired = false)
-      : Promise<Fetcher<GatekeeperUserVerifier> | null> {
+      : Promise<NativeRpcStub<NativeRpcTarget> | null> {
     if (caller.from !== "gadget" && caller.from !== "agent") return null;
     if (!viewer) {
       if (viewerRequired) throw new Error("This Gadget session is no longer authorized.");
@@ -11719,7 +11720,7 @@ class OverseerImpl implements AgentHooks {
     const user = this.users.get(this.users.idFromString(viewer.userId));
     const verifier = await user.getVerifier(accountId, vendorId);
     if (!verifier) throw new Error("The selected account is no longer connected.");
-    return verifier;
+    return new NativeRpcStub(new ObserverVerifierAdapter(verifier));
   }
   // Render the observer verification failures as one line per binding, naming the connection and the
   // account that was refused: `<resourceTitle> (<account label>) — <reason>`. Cold path only (we're
@@ -15809,7 +15810,7 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
     this.#end = impl.sessionWatchers.newQueue();
   }
 
-  getObserverVerifier(): Promise<Fetcher<GatekeeperUserVerifier> | null> {
+  getObserverVerifier(): Promise<NativeRpcStub<NativeRpcTarget> | null> {
     return this.impl.getObserverVerifier(
         this.gatekeeperId, this.caller, this.viewer, this.viewerRequired);
   }
