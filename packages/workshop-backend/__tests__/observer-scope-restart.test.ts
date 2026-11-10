@@ -22,6 +22,9 @@ import { openFakeOverseer } from "./fixtures.js";
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
     TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>;
+    // Entrypoints of a separate Worker (see `observerProbe` in vitest.config.ts).
+    TEST_MCP_VERIFIER: Fetcher;
+    TEST_PROBE_FACET: Fetcher;
   }
 }
 
@@ -64,7 +67,9 @@ describe("observer verifier loopbacks", () => {
 
     // Two collaborators with distinct accounts on gatekeeper 1; `asked` records every
     // (user, accountId, vendorId) the kernel resolved a verifier for.
-    function seedCollaborators(impl: any, access: (profileId: string) => unknown = () => ({role: "use"})) {
+    function seedCollaborators(
+        impl: any, access: (profileId: string) => unknown = () => ({role: "use"}),
+        makeVerifier: () => unknown = () => ({})) {
       seedGatekeeper(impl, 1);
       impl.storage.observers.put({profileId: "alice", observerId: "obs-a", accountChoices: {1: 10}});
       impl.storage.observers.put({profileId: "bob", observerId: "obs-b", accountChoices: {1: 20}});
@@ -76,7 +81,7 @@ describe("observer verifier loopbacks", () => {
         get: (userId: string) => ({
           getVerifier: async (accountId: number, vendorId: string) => {
             asked.push([userId, accountId, vendorId]);
-            return {};
+            return makeVerifier();
           },
         }),
       };
@@ -94,6 +99,28 @@ describe("observer verifier loopbacks", () => {
         ["alice-user", 10, "testvendor"],
         ["bob-user", 20, "testvendor"],
       ]);
+    }));
+
+    // A gatekeeper facet is reached through a stub in production, so the queue it is handed, and
+    // whatever the queue returns, cross a Worker-to-Worker RPC boundary; a plain-object facet never
+    // serializes anything. This facet and the verifier it calls are entrypoints of a separate
+    // Worker, like a gatekeeper's: every call the MCP gatekeepers make on the verifier must arrive
+    // with its arguments and return its value. It does not by itself fail on a raw `Fetcher`
+    // return, so it checks the forwarding, not the "Proxy could not be serialized" case.
+    it("hands a facet a verifier whose every forwarded call works across RPC", () => withImpl(async impl => {
+      seedCollaborators(impl, undefined, () => env.TEST_MCP_VERIFIER);
+
+      let result = await impl.openGatekeeperSession(
+          1, env.TEST_PROBE_FACET, CALLER, undefined, undefined, viewer("alice"), true);
+
+      expect(result).toEqual({
+        accountId: "account-alice",
+        connection: {
+          authorization: "Bearer https://example.com/mcp", sessionId: null, generation: 3,
+        },
+        stored: true,
+        checks: [undefined, undefined, undefined],
+      });
     }));
 
     it("refuses a runtime key that belongs to someone else", () => withImpl(async impl => {

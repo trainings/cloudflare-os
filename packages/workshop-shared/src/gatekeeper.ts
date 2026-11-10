@@ -1380,12 +1380,17 @@ export interface SlashCommandProvider extends RpcTarget {
  */
 export interface ApprovalQueue extends ObservationAuthorizer {
   /**
-   * Returns the connected-account verifier chosen by the authenticated observer for this binding:
-   * the same capability `addObserver` receives for that observer. Account-specific gatekeepers may
-   * use it for observer-scoped requests. A missing result means this caller has no observer
-   * account (for example, the owner or an agent session).
+   * Returns a stub for the connected account the authenticated observer chose for this binding,
+   * for observer-scoped requests. A missing result means this caller has no observer account (for
+   * example, the owner or an agent session).
+   *
+   * This is not the `GatekeeperUserVerifier` that `addObserver` receives for the same observer: a
+   * native `Fetcher` cannot be returned through the Workshop's validated RPC, so the Workshop hands
+   * back a stub that forwards only the calls the MCP gatekeepers make (`ObserverMcpVerifier` in the
+   * Workshop backend). A gatekeeper with a different account surface cannot use it until the
+   * Workshop forwards that surface too.
    */
-  getObserverVerifier?(): Promise<Fetcher<GatekeeperUserVerifier> | null>;
+  getObserverVerifier?(): Promise<RpcStub<RpcTarget> | null>;
 
   // TODO: Method to indicate that the gadget tried to perform an action that the gatekeeper itself
   //   hasn't been authorized to do (e.g. the user hasn't authorized the right OAuth scopes). The
