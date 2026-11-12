@@ -963,6 +963,16 @@ export interface GatekeeperUser extends WorkerEntrypoint {
 }
 
 /**
+ * What a collaborator is being admitted to when `Gatekeeper.addObserver()` is called for them.
+ *
+ * - `"workspace"`: a "build" collaborator, who reads the workspace's chats and so everything any
+ *   account has read through its connections.
+ * - `"gadget"`: a "use" collaborator, who only runs the Gadgets they were given, each in a runtime
+ *   of their own (see `ApprovalQueue.getObserverVerifier`) and without access to chats.
+ */
+export type ObserverAdmission = "workspace" | "gadget";
+
+/**
  * Opaque object representing one of a user's accounts. Minted by `GatekeeperUser`, and then passed
  * to `Gatekeeper.addObserver()` or `Gatekeeper.verifyObserverAccess()`, to verify whether the user
  * is able to access a particular Gatekeeper, and to `Gatekeeper.applyCreation()`, to create a
@@ -1106,8 +1116,13 @@ export interface Gatekeeper<Session> extends DurableObject {
    * track here what its reads report as subresources, but must keep enforcing everything else:
    * any binding-wide requirement its reads rely on (such as tenant membership), the reads that
    * omit subresources, and whatever it recorded before it began reporting them.
+   *
+   * `admission` says what the observer is being admitted for. Absent, it is `"workspace"`, the
+   * stricter of the two, so a Workshop that predates the argument is never read as more lenient.
    */
-  addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void>;
+  addObserver(
+      id: string, user: Fetcher<GatekeeperUserVerifier>, admission?: ObserverAdmission)
+      : Promise<void>;
 
   /**
    * Notifies the gatekeeper that it can stop tracking the given observer, who was previously
@@ -1364,6 +1379,19 @@ export interface SlashCommandProvider extends RpcTarget {
  * called before applying them.
  */
 export interface ApprovalQueue extends ObservationAuthorizer {
+  /**
+   * Returns a stub for the connected account the authenticated observer chose for this binding,
+   * for observer-scoped requests. A missing result means this caller has no observer account (for
+   * example, the owner or an agent session).
+   *
+   * This is not the `GatekeeperUserVerifier` that `addObserver` receives for the same observer: a
+   * native `Fetcher` cannot be returned through the Workshop's validated RPC, so the Workshop hands
+   * back a stub that forwards only the calls the MCP gatekeepers make (`ObserverMcpVerifier` in the
+   * Workshop backend). A gatekeeper with a different account surface cannot use it until the
+   * Workshop forwards that surface too.
+   */
+  getObserverVerifier?(): Promise<RpcStub<RpcTarget> | null>;
+
   // TODO: Method to indicate that the gadget tried to perform an action that the gatekeeper itself
   //   hasn't been authorized to do (e.g. the user hasn't authorized the right OAuth scopes). The
   //   system should direct the user to the right UI to authorize the action.

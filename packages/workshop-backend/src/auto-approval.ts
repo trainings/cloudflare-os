@@ -94,6 +94,9 @@ export class AutoApprovalDrainer {
 
     for (let record of pending) {
       if (record.type !== "action") continue;
+      // A collaborator's own action runs with their account and only they may resolve it, so the
+      // workspace's rules neither apply it nor let it act as a manual gate for the others.
+      if (record.observerProfileId !== undefined) continue;
 
       let rule = autoApprovalRule(this.storage, gatekeeperId, record.description);
       if (rule === undefined) {

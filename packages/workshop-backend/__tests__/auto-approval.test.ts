@@ -128,6 +128,29 @@ describe("AutoApprovalDrainer.drain", () => {
     expect(getAction(storage, 3).state).toBe("approved");
   });
 
+  // A collaborator's observer action runs with their own account and only they may resolve it, so
+  // the author's rules must neither apply it nor let it act as a manual gate for other actions.
+  it("never auto-applies a collaborator's observer action and does not let it block others", async () => {
+    let storage = makeStorage();
+    enableRule(storage);
+    putAction(storage, 1);
+    putAction(storage, 2, { autoApprovable: false });  // would be a manual gate, but it's theirs
+    putAction(storage, 3);
+    putAction(storage, 4);  // would match the rule, but it's theirs
+    for (let id of [2, 4]) {
+      let record = getAction(storage, id);
+      record.observerProfileId = "collab-profile";
+      storage.actions.put(record);
+    }
+
+    let { applyFn, calls } = makeImmediateApply(storage);
+    await new AutoApprovalDrainer(storage, applyFn).drain(GK);
+
+    expect(calls).toEqual([1, 3]);
+    expect(getAction(storage, 2).state).toBe("pending");
+    expect(getAction(storage, 4).state).toBe("pending");
+  });
+
   // Two concurrent drains for the same gatekeeper must not double-apply. The input gate is open
   // across the apply await, so without the single-flight guard the second drain's pending re-check
   // would see the still-"pending" record and apply it again.
