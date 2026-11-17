@@ -190,6 +190,23 @@ type SingletonAccountStub = Required<Pick<GatekeeperUser, "getSingletonGatekeepe
 type CreationConfiguratorStub = Required<Pick<GatekeeperUser, "startCreationConfigurator">>;
 type FileSaverStub = Required<Pick<GatekeeperUser, "saveFile">>;
 
+/**
+ * How long a subscription waits for an account's Gatekeeper to report its grants before it shows the
+ * stored description instead, so one slow Gatekeeper can't hold up the whole account list.
+ */
+const GRANT_METADATA_TIMEOUT_MS = 3_000;
+
+// Rejects if `promise` hasn't settled within `ms`. The abandoned call keeps running, so its
+// eventual failure is swallowed rather than reported as unhandled.
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  promise.catch(() => {});
+  let timer: ReturnType<typeof setTimeout>;
+  let expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer));
+}
+
 function areCredentialsValid(record: ConnectedAccountRecord): boolean {
   if (record.credentialsExpired) return false;
   if (record.credentialExpiresAt && record.credentialExpiresAt.valueOf() < Date.now()) return false;
@@ -2557,17 +2574,24 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       // Older connected-account records may predate `grantedResourceUrlPatterns`. Refresh only
       // that missing metadata from the live account description so Gatekeepers that now report
       // their grants can update existing accounts without reconnecting. Keep the persisted account
-      // description as a fallback if the Gatekeeper cannot be reached during this subscription.
+      // description as a fallback if the Gatekeeper is slow or cannot be reached. What it reports is
+      // stored, so later subscriptions don't ask again.
       let accountDescription = record.description;
       if (accountDescription.grantedResourceUrlPatterns === undefined &&
           supportedResources.some(resource => resource.grantable)) {
         try {
-          let currentDescription = await record.account.describe();
-          if (currentDescription.grantedResourceUrlPatterns !== undefined) {
-            accountDescription = {
-              ...accountDescription,
-              grantedResourceUrlPatterns: currentDescription.grantedResourceUrlPatterns,
-            };
+          let currentDescription =
+              await withTimeout(record.account.describe(), GRANT_METADATA_TIMEOUT_MS);
+          let granted = currentDescription.grantedResourceUrlPatterns;
+          if (granted !== undefined) {
+            accountDescription = { ...accountDescription, grantedResourceUrlPatterns: granted };
+            let current = connectedAccounts.get(record.id);
+            if (current && current.description.grantedResourceUrlPatterns === undefined) {
+              connectedAccounts.put({
+                ...current,
+                description: { ...current.description, grantedResourceUrlPatterns: granted },
+              });
+            }
           }
         } catch (err) {
           logger.warn("failed to refresh connected account grant metadata", {

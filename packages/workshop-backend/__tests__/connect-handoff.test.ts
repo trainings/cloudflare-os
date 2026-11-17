@@ -38,7 +38,9 @@ type UserInternals = UserDurableObject & {
   };
 };
 
-type FakeAccountProps = { name: string; failRevoke?: boolean; failDescribe?: boolean };
+type FakeAccountProps = {
+  name: string; failRevoke?: boolean; failDescribe?: boolean; grants?: string[]; describeDelayMs?: number;
+};
 
 let userCounter = 0;
 function freshUser() {
@@ -382,6 +384,75 @@ describe("connect handoff", () => {
     });
 
     expect(await stub.ensureAccountResources(0, [])).toBeNull();
+  });
+
+  describe("account list for an account that predates its recorded grants", () => {
+    // Subscribes the way the Workshop does, collecting the descriptions the list is shown.
+    async function subscribe(user: UserInternals) {
+      const shown: Array<Record<string, unknown>> = [];
+      const subscriber = {
+        dup() { return this; },
+        [Symbol.dispose]() {},
+        async add(_id: number, description: Record<string, unknown>) { shown.push(description); },
+        remove() {},
+        async ready() {},
+      };
+      // The test environment binds neither a gatekeeper nor the KV the admin config is read from.
+      Object.assign(user, {
+        vendors: new Map([["github", { describe: async () => ({ displayName: "GitHub" }) }]]),
+        env: { ...user.env, BLUEPRINTS: { get: async () => null } },
+      });
+      const handle = await user.subscribeConnectedAccounts(subscriber as never);
+      handle[Symbol.dispose]();
+      return shown;
+    }
+
+    function legacyAccount(user: UserInternals, name: string, options: Omit<FakeAccountProps, "name">) {
+      const { account, calls } = fakeAccount(user, name, options);
+      user.storage.nextAccountId.put(1);
+      user.storage.connectedAccounts.put({
+        id: 0, account, vendorId: "github", description: { displayName: name },
+      });
+      return calls;
+    }
+
+    it("stores the grants the gatekeeper reports, so later subscriptions don't ask again", async () => {
+      const { inDo } = freshUser();
+      await inDo(async user => {
+        const calls = legacyAccount(user, "legacy", { grants: ["https://example.com/:id"] });
+
+        expect(await subscribe(user)).toMatchObject([
+          { grantedResourceUrlPatterns: ["https://example.com/:id"] },
+        ]);
+        expect(user.storage.connectedAccounts.get(0)?.description)
+          .toMatchObject({ grantedResourceUrlPatterns: ["https://example.com/:id"] });
+
+        const askedOnce = (await calls()).filter(call => call === "describe").length;
+        await subscribe(user);
+        expect((await calls()).filter(call => call === "describe").length).toBe(askedOnce);
+      });
+    });
+
+    it("shows the stored description when the gatekeeper is too slow, without storing a guess", async () => {
+      const { inDo } = freshUser();
+      await inDo(async user => {
+        legacyAccount(user, "slow", { grants: ["https://example.com/:id"], describeDelayMs: 10_000 });
+
+        const started = Date.now();
+        const shown = await subscribe(user);
+        expect(Date.now() - started).toBeLessThan(6_000);
+        expect(shown).toEqual([{ displayName: "slow" }]);
+        expect(user.storage.connectedAccounts.get(0)?.description).toEqual({ displayName: "slow" });
+      });
+    }, 15_000);
+
+    it("shows the stored description when the gatekeeper fails", async () => {
+      const { inDo } = freshUser();
+      await inDo(async user => {
+        legacyAccount(user, "broken", { grants: [], failDescribe: true });
+        expect(await subscribe(user)).toEqual([{ displayName: "broken" }]);
+      });
+    });
   });
 
   it("stages through the gatekeeper-facing callback exactly as a connector calls it", async () => {
