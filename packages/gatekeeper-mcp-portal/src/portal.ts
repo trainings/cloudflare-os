@@ -283,6 +283,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
     const config = readPortalConfig(this.env);
     return {
       displayName: config?.name ?? "Cloudflare MCP Server Portals",
+      perViewerAccount: true,
       url: "https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/mcp-portals/",
       logo: PORTAL_AVATAR,
       color: PORTAL_COLOR,

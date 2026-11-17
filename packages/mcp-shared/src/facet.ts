@@ -57,6 +57,11 @@ function viewerObserverKey(observerId: string): string {
   return `viewer-observer:${observerId}`;
 }
 
+/** Releases an RPC stub this facet was handed, where the stub supports it. */
+function disposeStub(stub: unknown): void {
+  (stub as Partial<Disposable> | null)?.[Symbol.dispose]?.();
+}
+
 function requireObserverAccount(value: unknown): McpObserverAccount {
   if (!value || (typeof value !== "object" && typeof value !== "function")) {
     throw new Error("This MCP account does not support observer-scoped sessions.");
@@ -253,10 +258,17 @@ export abstract class McpFacetBase<
     let host: McpSessionHost = this;
     let observerAccountId: string | undefined;
     if (observerVerifier) {
-      const observerAccount = requireObserverAccount(observerVerifier);
-      await observerAccount.verifyEndpoint(this.endpoint);
-      observerAccountId = await observerAccount.getAccountObjectId();
-      host = this.#sessionHost(observerAccount, observerAccountId);
+      // The session's calls keep using the account, so it is released with the session; a start
+      // that fails first releases it here.
+      try {
+        const observerAccount = requireObserverAccount(observerVerifier);
+        await observerAccount.verifyEndpoint(this.endpoint);
+        observerAccountId = await observerAccount.getAccountObjectId();
+        host = this.#sessionHost(observerAccount, observerAccountId);
+      } catch (err) {
+        disposeStub(observerVerifier);
+        throw err;
+      }
     }
 
     let SessionClass = this.sessionClass;
@@ -268,7 +280,18 @@ export abstract class McpFacetBase<
         event: "session.tool-methods.unavailable", error: err,
       });
     }
-    return new SessionClass(host, approvalQueue.dup());
+    const session = new SessionClass(host, approvalQueue.dup());
+    if (observerVerifier) {
+      const disposeSession = session[Symbol.dispose].bind(session);
+      session[Symbol.dispose] = () => {
+        try {
+          disposeSession();
+        } finally {
+          disposeStub(observerVerifier);
+        }
+      };
+    }
+    return session;
   }
 
   /**

@@ -16,6 +16,10 @@ import {
   type ToolCatalog,
 }
   from "./client.js";
+import type {
+  ObserverMcpAccount,
+  ObserverMcpConnection,
+} from "@gadgets/workshop-shared/gatekeeper";
 import { fetchOptions, type InsecureEnv } from "./fetch.js";
 import { MAX_TOOLS_PER_SERVER } from "./tools.js";
 
@@ -33,50 +37,22 @@ export type WithClientOptions = {
 };
 
 /**
- * Everything an account must hand over before a request can be made. One value rather than two
- * getters: every MCP request needs both, and asking separately costs two serialized round trips to
- * the account Durable Object.
+ * Everything an account must hand over before a request can be made. Defined with the account
+ * surface the Workshop forwards, so the two cannot drift.
  */
-export type McpConnection = {
-  /** Bearer token, or null for a public server. */
-  authorization: string | null;
-  /** Transport session id from a previous `initialize`, if one is cached. */
-  sessionId: string | null;
-  /**
-   * Persisted account generation. Every state write after an await returns this to the account, so
-   * work started before a reconnect cannot overwrite the new connection's tokens or session.
-   */
-  generation: number;
-};
+export type McpConnection = ObserverMcpConnection;
 
 /**
  * The part of an account Durable Object that a call needs, structural so this module does not depend
  * on either connector's `McpAccount`.
  */
-export type ConnectionAccount = {
-  /**
-   * `endpoint` binds the credential response to where the caller will send it. An account may be
-   * repointed while an older facet still exists; returning current credentials to that facet would
-   * send the new server's bearer token to the old server.
-   */
-  getConnection(endpoint: string): Promise<McpConnection>;
-  assertConnectionCurrent(endpoint: string, generation: number): Promise<void>;
-  setMcpSessionId(
-    endpoint: string,
-    generation: number,
-    previousSessionId: string | null,
-    sessionId: string | null,
-  ): Promise<boolean>;
-  noteCredentialsExpired(endpoint: string, generation: number): Promise<void>;
-};
+export type ConnectionAccount = Pick<
+  ObserverMcpAccount,
+  "getConnection" | "assertConnectionCurrent" | "setMcpSessionId" | "noteCredentialsExpired"
+>;
 
 /** Account capability supplied by an authenticated MCP observer for one binding session. */
-export interface McpObserverAccount extends ConnectionAccount {
-  /** Returns the account DO id so an approved write can later use the same user's credentials. */
-  getAccountObjectId(): Promise<string>;
-  /** Confirms this connected account is for the endpoint represented by the binding. */
-  verifyEndpoint(endpoint: string): Promise<void>;
-}
+export type McpObserverAccount = ObserverMcpAccount;
 
 /** The name this deployment gives when introducing itself to an MCP server. */
 export function clientName(env: ConnectionEnv): string {

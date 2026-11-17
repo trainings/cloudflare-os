@@ -284,3 +284,40 @@ it("bounds concurrent catalog reads", async () => {
   release();
   await Promise.all(searches);
 });
+
+function disposableAccount(overrides: Partial<McpObserverAccount> = {}) {
+  const disposed = { count: 0 };
+  const account = {
+    async getAccountObjectId() { return "collaborator-account"; },
+    async verifyEndpoint() {},
+    async getConnection() {
+      return { authorization: "collaborator-token", sessionId: null, generation: 1 };
+    },
+    async assertConnectionCurrent() {},
+    async setMcpSessionId() { return true; },
+    async noteCredentialsExpired() {},
+    [Symbol.dispose]() { disposed.count++; },
+    ...overrides,
+  } satisfies McpObserverAccount & Disposable;
+  return { account, disposed };
+}
+
+it("releases the collaborator's account stub when its session is disposed", async () => {
+  stubMcpEndpoint();
+  const { account, disposed } = disposableAccount();
+  const session = await facet().startSession({ ...queue, getObserverVerifier: async () => account } as never);
+
+  expect(disposed.count).toBe(0);
+  session[Symbol.dispose]();
+  expect(disposed.count).toBe(1);
+});
+
+it("releases the collaborator's account stub when the session fails to start", async () => {
+  const { account, disposed } = disposableAccount({
+    async verifyEndpoint() { throw new Error("wrong endpoint"); },
+  });
+
+  await expect(facet().startSession({ ...queue, getObserverVerifier: async () => account } as never))
+    .rejects.toThrow("wrong endpoint");
+  expect(disposed.count).toBe(1);
+});

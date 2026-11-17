@@ -71,6 +71,7 @@ import {
 } from "@gadgets/mcp-shared/user";
 import { connectFormHtml } from "./connect-form.js";
 import { serverIdFromEndpoint } from "./server-id.js";
+import { assertOwnServerSubresources } from "./server-subresources.js";
 import { mcpResourceFor, mcpResources } from "./resources.js";
 import type { ConfiguratorUIOption } from "@gadgets/configurator-ui";
 import { MCP_BASE_TYPES } from "@gadgets/mcp-shared/base-types";
@@ -186,6 +187,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
   async describe(): Promise<VendorDescription> {
     return {
       displayName: "MCP Server",
+      perViewerAccount: true,
       url: "https://modelcontextprotocol.io",
       logo: MCP_AVATAR,
       color: "#1a1d21",
@@ -503,6 +505,24 @@ export class McpGatekeeperImpl
    */
   get observationSubresources(): undefined {
     return undefined;
+  }
+
+  /**
+   * Checks the `server/<serverId>` requirements recorded before reads stopped reporting
+   * subresources. Nothing proves a collaborator may see what the owner read from a pasted
+   * endpoint, so only one admitted to run the Gadget in a runtime of their own passes: what they
+   * read is read with their own account. Any ID that is not this binding's server fails the whole
+   * call, which denies everyone in it.
+   */
+  async verifyObserverAccess(
+    observers: { id: string; verifier: Fetcher<GatekeeperUserVerifier> }[],
+    subresources: string[],
+  ): Promise<{ allowedObserverIds: string[] }> {
+    assertOwnServerSubresources(subresources, this.ctx.props.serverId);
+    return {
+      allowedObserverIds: observers.filter(observer => this.isViewerObserver(observer.id))
+        .map(observer => observer.id),
+    };
   }
 
   async describe(): Promise<ResourceDescription> {
