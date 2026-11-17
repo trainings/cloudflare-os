@@ -12,6 +12,12 @@ vi.mock('@cloudflare/kumo', async (importOriginal) => {
   return { ...actual, useKumoToastManager: () => toasts }
 })
 
+vi.mock('./components/CreationAccountModal', () => ({
+  CreationAccountModal: ({ onChoose }: { onChoose: (approval: { account: number }) => void }) => (
+    <button data-testid="creation-account-modal" onClick={() => onChoose({ account: 3 })}>Choose account</button>
+  ),
+}))
+
 import { deferred, entry, flushFrames, makeOverseer, makeTestRoot } from './action-test-harness'
 import { PendingObserverActions } from './PendingObserverActions'
 
@@ -75,6 +81,17 @@ describe('PendingObserverActions', () => {
 
     expect(overseer.approveAction).toHaveBeenCalledWith(7, undefined)
     expect(overseer.rejectAction).toHaveBeenCalledWith(7)
+  })
+
+  it('asks which account to create in before approving a creation, instead of doing nothing', async () => {
+    const overseer = await renderPending([entry(5, { creation: true, gatekeeperId: 2 })])
+
+    await act(async () => button('Approve').click())
+    expect(overseer.approveAction).not.toHaveBeenCalled()
+    expect(document.querySelector('[data-testid="creation-account-modal"]')).not.toBeNull()
+
+    await act(async () => button('Choose account').click())
+    expect(overseer.approveAction).toHaveBeenCalledWith(5, { account: 3 })
   })
 
   it('holds a write\'s buttons while its decision is in flight', async () => {

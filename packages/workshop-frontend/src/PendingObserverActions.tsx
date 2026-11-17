@@ -16,12 +16,13 @@ import { useResolveAction } from './useResolveAction'
 export function PendingObserverActions({ overseer }: { overseer: RpcStub<Overseer> }) {
   const { pending } = useActions(overseer)
   const [processing, setProcessing] = useState<Set<number>>(() => new Set())
-  const { resolveAction } = useResolveAction(overseer, setProcessing)
+  const { resolveAction, creationAccountModal } = useResolveAction(overseer, setProcessing)
   const actions = pending.filter(action => action.type === 'action')
 
   if (actions.length === 0) return null
   return (
     <section aria-label="Pending actions" aria-live="polite" className="flex flex-col gap-2 px-4 py-3 sm:px-6">
+      {creationAccountModal}
       {actions.map(action => (
         <Banner
           key={action.id}
