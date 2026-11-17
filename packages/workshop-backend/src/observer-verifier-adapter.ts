@@ -1,28 +1,9 @@
 import { RpcTarget as NativeRpcTarget } from "cloudflare:workers";
-import type { GatekeeperUserVerifier } from "@gadgets/workshop-shared/gatekeeper";
-
-// What an MCP connected account's verifier hands the MCP gatekeepers. Its source of truth is
-// `McpObserverAccount` and `ConnectionAccount` in `mcp-shared/src/connection.ts`; the Workshop does
-// not depend on that package, so the shapes are restated here and must change together with it.
-
-/** Credentials and session state an MCP account returns for one endpoint. */
-export interface ObserverMcpConnection {
-  authorization: string | null;
-  sessionId: string | null;
-  generation: number;
-}
-
-/** The calls the MCP gatekeepers make on a collaborator's connected-account verifier. */
-export interface ObserverMcpVerifier {
-  getAccountObjectId(): Promise<string>;
-  verifyEndpoint(endpoint: string): Promise<void>;
-  getConnection(endpoint: string): Promise<ObserverMcpConnection>;
-  assertConnectionCurrent(endpoint: string, generation: number): Promise<void>;
-  setMcpSessionId(
-      endpoint: string, generation: number, previous: string | null, next: string | null)
-      : Promise<boolean>;
-  noteCredentialsExpired(endpoint: string, generation: number): Promise<void>;
-}
+import type {
+  GatekeeperUserVerifier,
+  ObserverMcpAccount,
+  ObserverMcpConnection,
+} from "@gadgets/workshop-shared/gatekeeper";
 
 /**
  * The account capability `ApprovalQueue.getObserverVerifier` hands a gatekeeper facet serving one
@@ -33,19 +14,20 @@ export interface ObserverMcpVerifier {
  * serialized because it is not a valid RPC receiver type"), so it is forwarded through a plain
  * RpcTarget instead.
  *
- * This forwards only {@link ObserverMcpVerifier}, so it serves the MCP gatekeepers, the only callers
+ * This forwards only {@link ObserverMcpAccount}, so it serves the MCP gatekeepers, the only callers
  * of `getObserverVerifier` today. A gatekeeper with a different account surface needs its own
  * forwarder, or this one generalized.
  */
-export class ObserverVerifierAdapter extends NativeRpcTarget implements ObserverMcpVerifier {
-  private verifier: ObserverMcpVerifier;
+export class ObserverVerifierAdapter extends NativeRpcTarget implements ObserverMcpAccount {
+  private verifier: ObserverMcpAccount;
 
   constructor(verifier: Fetcher<GatekeeperUserVerifier>) {
     super();
     // `GatekeeperUserVerifier` declares no methods on purpose: the Workshop only passes it back to
-    // the gatekeeper that minted it (see its doc), so the MCP surface can only be asserted here,
-    // once, rather than on every forward.
-    this.verifier = verifier as unknown as ObserverMcpVerifier;
+    // the gatekeeper that minted it (see its doc), so the one thing it cannot know, that this
+    // vendor's verifier is an `ObserverMcpAccount`, is asserted here, once, rather than on every
+    // forward. The interface is the same one the MCP gatekeepers' verifiers implement.
+    this.verifier = verifier as unknown as ObserverMcpAccount;
   }
 
   getAccountObjectId(): Promise<string> {

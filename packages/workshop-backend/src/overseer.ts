@@ -5496,7 +5496,7 @@ class OverseerImpl implements AgentHooks {
     // If/when we support hiberation of the overseer, we'll need to do something more
     // sophisticated.
     let facetName = this.gadgetFacetName(gadgetId, runtime?.runtimeKey);
-    if (runtime) {
+    if (runtime && this.storage.gadgetRuntimes.get(facetName) === undefined) {
       this.storage.gadgetRuntimes.put({gadgetId, runtimeKey: runtime.runtimeKey, facetName});
     }
     let oldChat = this.#runningChatIds.get(facetName);
@@ -5531,6 +5531,7 @@ class OverseerImpl implements AgentHooks {
   async getGadgetFacet(
       gadgetId: WorkpieceId, chatId?: number, joinAs?: SessionHolder, runtime?: GadgetViewer)
       : Promise<RpcStub<any>> {
+    if (runtime && !await this.#needsViewerRuntime(gadgetId, chatId)) runtime = undefined;
     let facet = await this.getGadgetFacetFetcher(gadgetId, chatId, runtime);
     let leaveSession = joinAs ? this.joinSession(joinAs, gadgetId) : undefined;
     return facetRpcStub(facet, leaveSession,
@@ -11679,6 +11680,34 @@ class OverseerImpl implements AgentHooks {
         reach?.gadgetIds ?? "build", this.#inScopeGatekeepers(grant, reach));
   }
 
+  /**
+   * Whether a collaborator's run of `gadgetId` needs a runtime of their own: it reaches a
+   * connection whose vendor serves each viewer from their own account
+   * (VendorDescription.perViewerAccount). Any other Gadget runs in the one shared runtime, so its
+   * state stays shared. Anything this cannot rule out isolates: a Gadget running a chat's proposed
+   * changes (whose bindings may differ from the permanent ones this reads), and a vendor list that
+   * cannot be fetched or does not know the vendor.
+   */
+  async #needsViewerRuntime(gadgetId: WorkpieceId, chatId?: number): Promise<boolean> {
+    if (this.#resolveGadgetChatId(gadgetId, chatId) !== undefined) return true;
+    let vendorIds = new Set<string>();
+    for (let id of this.#gadgetReach(gadgetId).gatekeeperIds) {
+      let spec = this.storage.gatekeepers.get(id)?.creationSpec;
+      if (spec?.type === "gatekeeper") vendorIds.add(spec.vendorId);
+    }
+    if (vendorIds.size === 0) return false;
+    let vendors;
+    try {
+      vendors = await this.#listGatekeeperVendorsCached();
+    } catch {
+      return true;
+    }
+    return [...vendorIds].some(vendorId => {
+      let vendor = vendors.find(candidate => candidate.id === vendorId);
+      return vendor === undefined || vendor.description.perViewerAccount === true;
+    });
+  }
+
   /** Returns a viewer-scoped runtime key without exposing it to Gadget code. */
   getObserverRuntimeKey(profileId: string, userId: string): string | undefined {
     if (userId === this.ownerId) return undefined;
@@ -11874,10 +11903,12 @@ class OverseerImpl implements AgentHooks {
     let forger: Fetcher<RestoreForgerEntrypoint>;
     try {
       this.#codeIdMap.set(codeId, RESTORE_FORGER_WORKER);
-      // A collaborator's run forges stubs against its own user-scoped runtime, never the shared one.
+      // A collaborator's run forges stubs against its own user-scoped runtime, never the shared
+      // one, wherever the Gadget has one (see #needsViewerRuntime).
+      let isolated = viewer !== undefined && await this.#needsViewerRuntime(gadgetId, chatId);
       forger = await this.ctx.restore(
-          viewer ? {type: "gadget", gadgetId, codeId, runtime: viewer}
-                 : {type: "gadget", gadgetId, codeId});
+          isolated ? {type: "gadget", gadgetId, codeId, runtime: viewer}
+                   : {type: "gadget", gadgetId, codeId});
     } finally {
       this.#codeIdMap.delete(codeId);
     }
@@ -15810,15 +15841,28 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
     this.#end = impl.sessionWatchers.newQueue();
   }
 
-  getObserverVerifier(): Promise<NativeRpcStub<NativeRpcTarget> | null> {
-    return this.impl.getObserverVerifier(
+  // Set once this queue has handed the viewer's own account to the gatekeeper. Only then does the
+  // gatekeeper act as the viewer, so only then do its records belong to the viewer alone (see
+  // observer-actions.ts). A binding whose gatekeeper never asks keeps acting with the binding's
+  // account, so its actions stay in the workspace's own log for the owner to decide.
+  private viewerAccountIssued = false;
+
+  async getObserverVerifier(): Promise<NativeRpcStub<NativeRpcTarget> | null> {
+    let verifier = await this.impl.getObserverVerifier(
         this.gatekeeperId, this.caller, this.viewer, this.viewerRequired);
+    if (verifier !== null) this.viewerAccountIssued = true;
+    return verifier;
+  }
+
+  private get actingViewer(): GadgetViewer | undefined {
+    return this.viewerAccountIssued ? this.viewer : undefined;
   }
 
   authorizeObservation(description: ObservationDescription): Promise<void> {
     if (this.hookId !== undefined) requireLiveHook(this.impl, this.hookId);
     return this.impl.authorizeObservation(
-        this.gatekeeperId, description, this.caller, this.executionId, this.hookId, this.viewer);
+        this.gatekeeperId, description, this.caller, this.executionId, this.hookId,
+        this.actingViewer);
   }
 
   async getGitCache(): Promise<GitCache> {
@@ -15827,7 +15871,8 @@ class ApprovalQueueImpl extends RpcTarget implements ApprovalQueue {
 
   submitAction(action: number, description: ActionDescription): Promise<void> {
     if (this.hookId !== undefined) requireLiveHook(this.impl, this.hookId);
-    return this.impl.submitAction(this.gatekeeperId, action, description, this.caller, this.viewer);
+    return this.impl.submitAction(
+        this.gatekeeperId, action, description, this.caller, this.actingViewer);
   }
 
   bindHook<Hook extends RpcTarget>(
