@@ -1,13 +1,14 @@
-// The one subresource a bare MCP binding reports: `server/<serverId>`, naming the connected server.
+// The one subresource ID older bare MCP bindings reported: `server/<serverId>`, naming the connected
+// server. Reads no longer report it, but workspaces that recorded it still carry it as a requirement.
 
 import { formatSubresourceId, parseSubresourceId } from "@gadgets/gatekeeper-kit/subresource-ids";
 
 const SERVER_SUBRESOURCE = "server";
 
 /**
- * The subresource ID every observation through a binding to `serverId` reports. `serverId` is the
+ * The subresource ID reads through a binding to `serverId` used to report. `serverId` is the
  * binding's display slug (see `server-id.ts`), which can collide across hosts; that is harmless
- * because `verifyObserverAccess` admits no observer for any ID, and endpoint equality and
+ * because only collaborators admitted to a runtime of their own pass, and endpoint equality and
  * action-kind tags keep using the full endpoint.
  */
 export function serverSubresourceId(serverId: string): string {

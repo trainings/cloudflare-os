@@ -1,9 +1,9 @@
-// The portal facet's observer contract: every read through a binding reports the upstream server
-// its grant names as `server/<upstreamServerId>`, and both `addObserver()` and
-// `verifyObserverAccess()` admit only the account the binding reads with, refusing any ID the
-// binding did not report. The endpoint is faked at `withClient`, and the catalog is served from the
-// facet's cache. Approved-call results take the session's same reporting path, covered against the
-// session alone in mcp-shared, since the action store needs SQLite.
+// The portal facet's observer contract: reads report no subresources, because a collaborator reads
+// through their own per-viewer runtime and account. `addObserver()` opens the whole workspace only
+// to the account the binding reads with, and admits anyone else to run the Gadget only if their own
+// account reaches the portal; `verifyObserverAccess()` checks the `server/<id>` requirements older
+// reads recorded. The endpoint is faked at `withClient`, and the catalog is served from the facet's
+// cache.
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type * as Connection from "@gadgets/mcp-shared/connection";
@@ -39,14 +39,18 @@ const CATALOG = [
  * was persisted.
  */
 function portalFacet(scope: ToolScope & { serverId: string }) {
+  const kv = new Map<string, unknown>([
+    ["catalog", { tools: CATALOG, revision: "cached", fetchedAt: Date.now(), truncated: false }],
+  ]);
   const ctx = {
     props: {
       accountObjectId: "account-id", endpoint: ENDPOINT, serverId: "portal", serverName: "CF Portal", scope,
     },
     storage: {
       kv: {
-        get: () => ({ tools: CATALOG, revision: "cached", fetchedAt: Date.now(), truncated: false }),
-        put() {},
+        get: (key: string) => kv.get(key),
+        put: (key: string, value: unknown) => { kv.set(key, value); },
+        delete: (key: string) => { kv.delete(key); },
       },
     },
     exports: { McpAccount: { idFromString: () => "account-id", get: () => ({}) } },
@@ -78,12 +82,13 @@ beforeEach(() => {
     const fn = args[3] as (client: object) => unknown;
     return fn({
       callTool: async () => ({ content: [{ type: "text", text: "PROJ-1" }] }),
+      listTools: async () => [],
     });
   });
 });
 
 describe("portal observations", () => {
-  it("report the upstream server, not the portal, on every read, empty and cached ones included", async () => {
+  it("report no subresources on any read, since each viewer reads with their own account", async () => {
     const facet = portalFacet({ serverId: "jira" });
     const queue = recordingQueue();
     const session = await facet.startSession(queue as never);
@@ -96,7 +101,7 @@ describe("portal observations", () => {
 
     expect(queue.observations).toHaveLength(5);
     for (const observation of queue.observations) {
-      expect(observation.subresources, observation.title).toEqual(["server/jira"]);
+      expect(observation.subresources, observation.title).toBeUndefined();
     }
   });
 
@@ -109,62 +114,106 @@ describe("portal observations", () => {
     for (const name of ["jira_create_issue", "gitlab_list", "portal_list_servers"]) {
       await expect(session.callTool(name, {}), name).rejects.toThrow(/does not grant/);
     }
-    expect(queue.observations.map(observation => observation.subresources)).toEqual([["server/jira"]]);
+    expect(queue.observations.map(observation => observation.subresources)).toEqual([undefined]);
   });
 });
 
-describe("portal observer admission", () => {
-  it("allows only observers through the account the binding reads with", async () => {
-    const facet = portalFacet({ serverId: "jira" });
+/** A collaborator's own account, as `getVerifier()` mints it, whose endpoint check answers `reaches`. */
+function collaborator(account: string, reaches: boolean) {
+  return {
+    getAccountObjectId: async () => account,
+    verifyEndpoint: async () => {
+      if (!reaches) throw new Error("This account is not connected to the portal used by this binding.");
+    },
+    getConnection: async () => ({}),
+    assertConnectionCurrent: async () => {},
+    setMcpSessionId: async () => {},
+    noteCredentialsExpired: async () => {},
+  } as never;
+}
 
-    await expect(facet.verifyObserverAccess([
-      observer("connector", "account-id"),
-      // The same person or portal user, through another connected account.
-      observer("connector-elsewhere", "account-id-2"),
-      observer("colleague", "colleague-account"),
-    ], ["server/jira", "server/jira"])).resolves.toEqual({ allowedObserverIds: ["connector"] });
+describe("portal observer admission", () => {
+  it("has no subresources to verify", () => {
+    expect(portalFacet({ serverId: "jira" }).observationSubresources).toBeUndefined();
   });
 
-  it("admits the binding's account at every open, and refuses everyone else", async () => {
+  it("opens the whole workspace to the binding's own account only", async () => {
     const facet = portalFacet({ serverId: "jira" });
     const { verifier } = observer("connector", "account-id");
 
+    await expect(facet.addObserver("connector", verifier, "workspace")).resolves.toBeUndefined();
     await expect(facet.addObserver("connector", verifier)).resolves.toBeUndefined();
-    // The refusal says who can open it, since the collaborator who added the connection can.
-    await expect(facet.addObserver("colleague", observer("colleague", "colleague-account").verifier))
-      .rejects.toThrow(/only be opened by its owner and by whoever added this connection/);
+    expect(mocks.withClient).not.toHaveBeenCalled();
+
+    const other = observer("colleague", "colleague-account").verifier;
+    await expect(facet.addObserver("colleague", other, "workspace"))
+      .rejects.toThrow(/can't open a workspace that uses this MCP connection/);
+    await expect(facet.addObserver("colleague", other))
+      .rejects.toThrow(/Share the Gadget with them instead/);
+    expect(mocks.withClient).not.toHaveBeenCalled();
   });
 
-  it("refuses the whole call for any ID the binding did not report", async () => {
+  it("admits another account to run the Gadget only if it reaches the portal and the endpoint accepts it", async () => {
     const facet = portalFacet({ serverId: "jira" });
-    const connector = observer("connector", "account-id");
-    for (const id of [
-      "server/gitlab",
-      // The portal's own id, which no read reports.
-      "server/portal",
-      "server/jira/tool/jira_search",
-      "mcp/server/jira",
-      "tool/jira",
-      "server/%6Aira",
-      "server/",
-      "server",
-      "",
-    ]) {
-      await expect(facet.verifyObserverAccess([connector], ["server/jira", id]), id)
-        .rejects.toThrow(/subresource ID/);
-    }
-    await expect(facet.verifyObserverAccess([connector], [])).rejects.toThrow(/no subresources/);
+
+    await expect(facet.addObserver("colleague", collaborator("colleague-account", true), "gadget"))
+      .resolves.toBeUndefined();
+    expect(mocks.withClient).toHaveBeenCalledOnce();
   });
 
-  it("fails the whole call when an observer's account cannot be read", async () => {
+  it("refuses an account that is not connected to this portal, without probing the endpoint", async () => {
     const facet = portalFacet({ serverId: "jira" });
-    const unreachable = {
-      id: "unreachable",
-      verifier: { getAccountObjectId: async () => { throw new Error("verifier unavailable"); } } as never,
-    };
 
-    await expect(facet.verifyObserverAccess(
-      [observer("connector", "account-id"), unreachable], ["server/jira"],
-    )).rejects.toThrow("verifier unavailable");
+    await expect(facet.addObserver("colleague", collaborator("colleague-account", false), "gadget"))
+      .rejects.toThrow(/not connected to the portal/);
+    expect(mocks.withClient).not.toHaveBeenCalled();
+  });
+
+  it("refuses a verifier that is not an observer-capable account", async () => {
+    const facet = portalFacet({ serverId: "jira" });
+    const bare = { getAccountObjectId: async () => "colleague-account" } as never;
+
+    await expect(facet.addObserver("colleague", bare, "gadget"))
+      .rejects.toThrow(/does not support observer-scoped sessions/);
+  });
+});
+
+describe("portal requirements recorded by older reads", () => {
+  const SERVER = "server/jira";
+
+  it("pass for the binding's account and for a collaborator admitted to run the Gadget, and fail for others", async () => {
+    const facet = portalFacet({ serverId: "jira" });
+    const owner = observer("owner-account", "account-id");
+    const viewer = observer("viewer", "viewer-account");
+    const stranger = observer("stranger", "stranger-account");
+    await facet.addObserver("viewer", collaborator("viewer-account", true), "gadget");
+
+    await expect(facet.verifyObserverAccess([owner, viewer, stranger], [SERVER]))
+      .resolves.toEqual({ allowedObserverIds: ["owner-account", "viewer"] });
+  });
+
+  it("stop passing for a collaborator once they are removed or refused the whole workspace", async () => {
+    const facet = portalFacet({ serverId: "jira" });
+    const viewer = observer("viewer", "viewer-account");
+    await facet.addObserver("viewer", collaborator("viewer-account", true), "gadget");
+
+    await facet.removeObserver("viewer");
+    await expect(facet.verifyObserverAccess([viewer], [SERVER]))
+      .resolves.toEqual({ allowedObserverIds: [] });
+
+    await facet.addObserver("viewer", collaborator("viewer-account", true), "gadget");
+    await expect(facet.addObserver("viewer", viewer.verifier, "workspace")).rejects.toThrow();
+    await expect(facet.verifyObserverAccess([viewer], [SERVER]))
+      .resolves.toEqual({ allowedObserverIds: [] });
+  });
+
+  it("fail the whole call for an ID that is not this binding's server", async () => {
+    const facet = portalFacet({ serverId: "jira" });
+    const owner = observer("owner-account", "account-id");
+
+    await expect(facet.verifyObserverAccess([owner], ["server/gitlab"]))
+      .rejects.toThrow(/different portal server/);
+    await expect(facet.verifyObserverAccess([owner], ["workspace/jira"]))
+      .rejects.toThrow(/Not an MCP Server Portals subresource ID/);
   });
 });

@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest";
 import { formatSubresourceId } from "@gadgets/gatekeeper-kit/subresource-ids";
 import { assertOwnServerSubresources, serverSubresourceId } from "../src/server-subresources.js";
 
-// `verifyObserverAccess` denies every observer, so the only behavior left to get wrong is which IDs
-// it accepts: anything this binding never reported must fail the call rather than pass silently.
+// `verifyObserverAccess` admits only runtime-scoped collaborators, so the behavior to get wrong is
+// which IDs it accepts: anything this binding never reported must fail the call rather than pass
+// silently.
 describe("assertOwnServerSubresources", () => {
   it("accepts the binding's own server ID", () => {
     expect(() => assertOwnServerSubresources([serverSubresourceId("linear")], "linear"))

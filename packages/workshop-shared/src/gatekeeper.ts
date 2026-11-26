@@ -77,6 +77,16 @@ export type VendorDescription = {
    * management UI (see AccountDescription.singleton / .providesUi).
    */
   autoProvisionsAccount?: boolean;
+
+  /**
+   * True if a Gadget run by a collaborator ("use" or "build") is served through that collaborator's
+   * own connected account for this vendor (see `ApprovalQueue.getObserverVerifier`), not the
+   * account the binding was made with. The Workshop then gives each such collaborator a Gadget
+   * runtime of their own, so their credentials and runtime state never cross to anyone else.
+   * Defaults to false: a Gadget whose bindings reach no such vendor runs in the one runtime
+   * everyone shares, and its state stays shared.
+   */
+  perViewerAccount?: boolean;
 }
 
 /**
@@ -1074,6 +1084,16 @@ export interface GatekeeperUser extends WorkerEntrypoint {
 }
 
 /**
+ * What a collaborator is being admitted to when `Gatekeeper.addObserver()` is called for them.
+ *
+ * - `"workspace"`: a "build" collaborator, who reads the workspace's chats and so everything any
+ *   account has read through its connections.
+ * - `"gadget"`: a "use" collaborator, who only runs the Gadgets they were given, each in a runtime
+ *   of their own (see `ApprovalQueue.getObserverVerifier`) and without access to chats.
+ */
+export type ObserverAdmission = "workspace" | "gadget";
+
+/**
  * Opaque object representing one of a user's accounts. Minted by `GatekeeperUser`, and then passed
  * to `Gatekeeper.addObserver()` or `Gatekeeper.verifyObserverAccess()`, to verify whether the user
  * is able to access a particular Gatekeeper, and to `Gatekeeper.applyCreation()`, to create a
@@ -1232,8 +1252,13 @@ export interface Gatekeeper<Session> extends DurableObject {
    * track here what its reads report as subresources, but must keep enforcing everything else:
    * any binding-wide requirement its reads rely on (such as tenant membership), the reads that
    * omit subresources, and whatever it recorded before it began reporting them.
+   *
+   * `admission` says what the observer is being admitted for. Absent, it is `"workspace"`, the
+   * stricter of the two, so a Workshop that predates the argument is never read as more lenient.
    */
-  addObserver(id: string, user: Fetcher<GatekeeperUserVerifier>): Promise<void>;
+  addObserver(
+      id: string, user: Fetcher<GatekeeperUserVerifier>, admission?: ObserverAdmission)
+      : Promise<void>;
 
   /**
    * Notifies the gatekeeper that it can stop tracking the given observer, who was previously
@@ -1524,12 +1549,70 @@ export interface SlashCommandProvider extends RpcTarget {
 }
 
 /**
+ * Credentials and session state a connected MCP account returns for one endpoint. One value rather
+ * than separate getters: every MCP request needs all of it, and asking separately costs serialized
+ * round trips to the account.
+ */
+export type ObserverMcpConnection = {
+  /** Bearer token, or null for a public server. */
+  authorization: string | null;
+  /** Transport session id from a previous `initialize`, if one is cached. */
+  sessionId: string | null;
+  /**
+   * Persisted account generation. Every state write after an await returns this to the account, so
+   * work started before a reconnect cannot overwrite the new connection's tokens or session.
+   */
+  generation: number;
+};
+
+/**
+ * The calls the MCP gatekeepers make on a viewer's own connected account, which
+ * `ApprovalQueue.getObserverVerifier()` hands them. The MCP gatekeepers' verifiers implement it,
+ * and the Workshop forwards exactly these calls, so all three stay in step with this one type.
+ */
+export interface ObserverMcpAccount {
+  /** Returns the account DO id so an approved write can later use the same user's credentials. */
+  getAccountObjectId(): Promise<string>;
+  /** Confirms this connected account is for the endpoint represented by the binding. */
+  verifyEndpoint(endpoint: string): Promise<void>;
+  /**
+   * `endpoint` binds the credential response to where the caller will send it. An account may be
+   * repointed while an older facet still exists; returning current credentials to that facet would
+   * send the new server's bearer token to the old server.
+   */
+  getConnection(endpoint: string): Promise<ObserverMcpConnection>;
+  /** Throws unless `generation` is still the account's current one for `endpoint`. */
+  assertConnectionCurrent(endpoint: string, generation: number): Promise<void>;
+  /** Swaps the cached transport session id if it is still `previousSessionId`; false if not. */
+  setMcpSessionId(
+    endpoint: string,
+    generation: number,
+    previousSessionId: string | null,
+    sessionId: string | null,
+  ): Promise<boolean>;
+  /** Records that the credentials for `endpoint` were refused, so the account can ask to reconnect. */
+  noteCredentialsExpired(endpoint: string, generation: number): Promise<void>;
+}
+
+/**
  * Used by a gatekeeper to request an action that has side effects (is not read-only). Any such
  * action may be subject to human-in-the-loop approval and audit logging. Whether or not review is
  * actually required, the gatekeeper must still submit all actions and wait for apply() to be
  * called before applying them.
  */
 export interface ApprovalQueue extends ObservationAuthorizer {
+  /**
+   * Returns a stub for the connected account the authenticated observer chose for this binding,
+   * for observer-scoped requests. A missing result means this caller has no observer account (for
+   * example, the owner or an agent session).
+   *
+   * This is not the `GatekeeperUserVerifier` that `addObserver` receives for the same observer: a
+   * native `Fetcher` cannot be returned through the Workshop's validated RPC, so the Workshop hands
+   * back a stub that forwards only the calls of `ObserverMcpAccount`. A gatekeeper with a different
+   * account surface cannot use it until the Workshop forwards that surface too.
+   */
+  getObserverVerifier?(): Promise<RpcStub<RpcTarget> | null>;
+
   // TODO: Method to indicate that the gadget tried to perform an action that the gatekeeper itself
   //   hasn't been authorized to do (e.g. the user hasn't authorized the right OAuth scopes). The
   //   system should direct the user to the right UI to authorize the action.

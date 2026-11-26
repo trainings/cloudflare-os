@@ -22,12 +22,257 @@ import { openFakeOverseer } from "./fixtures.js";
 declare module "cloudflare:workers" {
   interface ProvidedEnv {
     TEST_OVERSEER: DurableObjectNamespace<OverseerDurableObject>;
+    // Entrypoints of a separate Worker (see `observerProbe` in vitest.config.ts).
+    TEST_MCP_VERIFIER: Fetcher;
+    TEST_PROBE_FACET: Fetcher;
   }
 }
 
 const OWNER = "owner";
 const AGENT: AiChatAuthorInfo = { type: "agent", id: "some-model", name: "Agent" };
 const USER_META = { profile: { type: "user", id: OWNER, name: "Owner" } as AiChatAuthorInfo };
+
+describe("observer verifier loopbacks", () => {
+  it("fails closed when a collaborator loopback loses its viewer", () => withImpl(async impl => {
+    seedGatekeeper(impl, 1);
+    let facet = { startSession: async (queue: any) => queue.getObserverVerifier() };
+
+    // The owner uses the shared runtime, so no observer verifier is expected.
+    await expect(impl.openGatekeeperSession(
+        1, facet as any, {from: "gadget", gadgetId: 1})).resolves.toBeNull();
+
+    // A collaborator loopback retains this marker separately from the viewer identity. Losing the
+    // viewer then rejects session creation instead of silently taking the owner's MCP account.
+    await expect(impl.openGatekeeperSession(
+        1, facet as any, {from: "gadget", gadgetId: 1}, undefined, undefined, true))
+        .rejects.toThrow(/no longer authorized/);
+  }));
+
+  it("tags an observation made by a collaborator's runtime with their profile", () => withImpl(async impl => {
+    seedGatekeeper(impl, 1);
+    let read = {title: "Search", description: "Searched issues."};
+    let viewer = {userId: "alice-user", profileId: "alice", runtimeKey: "obs-a"};
+
+    await impl.authorizeObservation(1, read, {from: "gadget", gadgetId: 1}, undefined, undefined, viewer);
+    await impl.authorizeObservation(1, read, {from: "gadget", gadgetId: 1});
+
+    let records = [...impl.storage.actions.list()].filter((r: any) => r.type === "observation");
+    expect(records.map((r: any) => r.observerProfileId)).toEqual(["alice", undefined]);
+  }));
+
+  // A viewer's runtime may only ever resolve the account that same viewer chose: never another
+  // collaborator's, and never the workspace owner's.
+  describe("getObserverVerifier", () => {
+    const CALLER = {from: "gadget", gadgetId: 1} as const;
+
+    // Two collaborators with distinct accounts on gatekeeper 1; `asked` records every
+    // (user, accountId, vendorId) the kernel resolved a verifier for.
+    function seedCollaborators(
+        impl: any, access: (profileId: string) => unknown = () => ({role: "use"}),
+        makeVerifier: () => unknown = () => ({})) {
+      seedGatekeeper(impl, 1);
+      impl.storage.observers.put({profileId: "alice", observerId: "obs-a", accountChoices: {1: 10}});
+      impl.storage.observers.put({profileId: "bob", observerId: "obs-b", accountChoices: {1: 20}});
+      impl.getSharingManager = async () => ({getEffectiveAccess: access});
+      let asked: Array<[string, number, string]> = [];
+      impl.users = {
+        idFromString: (id: string) => id,
+        idFromName: (name: string) => ({ toString: () => `${name}-user` }),
+        get: (userId: string) => ({
+          getVerifier: async (accountId: number, vendorId: string) => {
+            asked.push([userId, accountId, vendorId]);
+            return makeVerifier();
+          },
+        }),
+      };
+      return asked;
+    }
+
+    const viewer = (name: "alice" | "bob", runtimeKey = name === "alice" ? "obs-a" : "obs-b") =>
+        ({userId: `${name}-user`, profileId: name, runtimeKey});
+
+    it("resolves the viewer's own chosen account", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl);
+      await impl.getObserverVerifier(1, CALLER, viewer("alice"), true);
+      await impl.getObserverVerifier(1, CALLER, viewer("bob"), true);
+      expect(asked).toEqual([
+        ["alice-user", 10, "testvendor"],
+        ["bob-user", 20, "testvendor"],
+      ]);
+    }));
+
+    // A gatekeeper facet is reached through a stub in production, so the queue it is handed, and
+    // whatever the queue returns, cross a Worker-to-Worker RPC boundary; a plain-object facet never
+    // serializes anything. This facet and the verifier it calls are entrypoints of a separate
+    // Worker, like a gatekeeper's: every call the MCP gatekeepers make on the verifier must arrive
+    // with its arguments and return its value. It does not by itself fail on a raw `Fetcher`
+    // return, so it checks the forwarding, not the "Proxy could not be serialized" case.
+    it("hands a facet a verifier whose every forwarded call works across RPC", () => withImpl(async impl => {
+      seedCollaborators(impl, undefined, () => env.TEST_MCP_VERIFIER);
+
+      let result = await impl.openGatekeeperSession(
+          1, env.TEST_PROBE_FACET, CALLER, undefined, undefined, viewer("alice"), true);
+
+      expect(result).toEqual({
+        accountId: "account-alice",
+        connection: {
+          authorization: "Bearer https://example.com/mcp", sessionId: null, generation: 3,
+        },
+        stored: true,
+        checks: [undefined, undefined, undefined],
+      });
+    }));
+
+    // A collaborator's records belong to them alone only when the gatekeeper acts as them, which
+    // is what taking their account from the queue means. A gatekeeper that never asks keeps using
+    // the binding's own account, so what it reports stays visible to the workspace owner.
+    describe("whose records a session's observations are", () => {
+      const read = {title: "Search", description: "Searched issues."};
+      const observationOwners = (impl: any) =>
+          [...impl.storage.actions.list()].filter((r: any) => r.type === "observation")
+              .map((r: any) => r.observerProfileId);
+
+      it("tags them with the viewer once the gatekeeper took the viewer's account", () => withImpl(async impl => {
+        seedCollaborators(impl);
+        let facet = {startSession: async (queue: any) => {
+          await queue.getObserverVerifier();
+          await queue.authorizeObservation(read);
+        }};
+
+        await impl.openGatekeeperSession(1, facet as any, CALLER, undefined, undefined, viewer("alice"), true);
+
+        expect(observationOwners(impl)).toEqual(["alice"]);
+      }));
+
+      it("leaves them to the workspace when the gatekeeper never took the viewer's account", () => withImpl(async impl => {
+        seedCollaborators(impl);
+        let facet = {startSession: async (queue: any) => { await queue.authorizeObservation(read); }};
+
+        await impl.openGatekeeperSession(1, facet as any, CALLER, undefined, undefined, viewer("alice"), true);
+
+        expect(observationOwners(impl)).toEqual([undefined]);
+      }));
+
+      it("leaves the owner's own sessions untagged", () => withImpl(async impl => {
+        seedCollaborators(impl);
+        let facet = {startSession: async (queue: any) => {
+          await queue.getObserverVerifier();
+          await queue.authorizeObservation(read);
+        }};
+
+        await impl.openGatekeeperSession(1, facet as any, CALLER);
+
+        expect(observationOwners(impl)).toEqual([undefined]);
+      }));
+    });
+
+    // A collaborator gets a runtime of their own only for a Gadget that reaches a connection whose
+    // vendor serves each viewer from their own account; every other Gadget keeps the one runtime
+    // everyone shares, and its state with it. When unsure, the Gadget is isolated.
+    describe("which Gadgets run in a runtime of the viewer's own", () => {
+      const vendors = [
+        {id: "testvendor", description: {perViewerAccount: true}},
+        {id: "sharedvendor", description: {}},
+      ];
+
+      // Returns, for one `getGadgetFacet` call, the runtime the Gadget was actually opened with.
+      async function openedWith(
+          impl: any, chatId?: number, listVendors: () => Promise<unknown> = async () => vendors,
+          gadgetId = 100) {
+        impl.ownerId = "owner-id";
+        impl.wrapUserDo = (stub: unknown) => stub;
+        impl.users = {
+          idFromString: (id: string) => id,
+          get: () => ({listGatekeeperVendors: listVendors}),
+        };
+        let seen: unknown[] = [];
+        impl.getGadgetFacetFetcher = async (_id: number, _chat: unknown, runtime: unknown) => {
+          seen.push(runtime);
+          return {};
+        };
+        await impl.getGadgetFacet(gadgetId, chatId, undefined, viewer("alice"));
+        return seen[0];
+      }
+
+      function seedGadgetBoundTo(impl: any, vendorId: string, bindings: object = {DB: {target: 1}}) {
+        seedGatekeeper(impl, 1);
+        let record = impl.storage.gatekeepers.get(1);
+        impl.storage.gatekeepers.put({...record, creationSpec: {...record.creationSpec, vendorId}});
+        impl.storage.gadgets.put(
+            {type: "gadget", id: 100, title: "G", created: new Date(0), bindingName: "G", bindings});
+      }
+
+      it("isolates a Gadget bound to a per-viewer vendor", () => withImpl(async impl => {
+        seedGadgetBoundTo(impl, "testvendor");
+        expect(await openedWith(impl)).toEqual(viewer("alice"));
+      }));
+
+      it("isolates a Gadget that reaches one only through another Gadget", () => withImpl(async impl => {
+        seedGadgetBoundTo(impl, "testvendor");
+        impl.storage.gadgets.put({
+          type: "gadget", id: 101, title: "Outer", created: new Date(0), bindingName: "O",
+          bindings: {INNER: {target: 100}},
+        });
+        expect(await openedWith(impl, undefined, undefined, 101)).toEqual(viewer("alice"));
+      }));
+
+      it("shares the runtime of a Gadget bound only to other vendors", () => withImpl(async impl => {
+        seedGadgetBoundTo(impl, "sharedvendor");
+        expect(await openedWith(impl)).toBeUndefined();
+      }));
+
+      it("shares the runtime of a Gadget with no connections", () => withImpl(async impl => {
+        seedGadgetBoundTo(impl, "sharedvendor", {});
+        expect(await openedWith(impl)).toBeUndefined();
+      }));
+
+      it("isolates when the vendor list cannot be read", () => withImpl(async impl => {
+        seedGadgetBoundTo(impl, "sharedvendor");
+        expect(await openedWith(impl, undefined, async () => { throw new Error("down"); }))
+            .toEqual(viewer("alice"));
+      }));
+
+      it("isolates a connection whose vendor is unknown", () => withImpl(async impl => {
+        seedGadgetBoundTo(impl, "retired");
+        expect(await openedWith(impl)).toEqual(viewer("alice"));
+      }));
+    });
+
+    it("refuses a runtime key that belongs to someone else", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl);
+      // Bob's profile presented with Alice's runtime (or the reverse) must not resolve anything.
+      await expect(impl.getObserverVerifier(1, CALLER, viewer("bob", "obs-a"), true))
+          .rejects.toThrow(/no longer authorized/);
+      await expect(impl.getObserverVerifier(1, CALLER, viewer("alice", "shared"), true))
+          .rejects.toThrow(/no longer authorized/);
+      expect(asked).toEqual([]);
+    }));
+
+    it("refuses a viewer whose user id is not their profile's own", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl);
+      // Bob's profile paired with Alice's user would resolve Alice's accounts.
+      await expect(impl.getObserverVerifier(
+          1, CALLER, { ...viewer("bob"), userId: "alice-user" }, true))
+          .rejects.toThrow(/no longer authorized/);
+      expect(asked).toEqual([]);
+    }));
+
+    it("refuses a viewer whose access has been revoked", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl, profileId => profileId === "bob" ? null : {role: "use"});
+      await expect(impl.getObserverVerifier(1, CALLER, viewer("bob"), true))
+          .rejects.toThrow(/no longer authorized/);
+      expect(asked).toEqual([]);
+    }));
+
+    it("refuses a viewer with no account chosen for the binding", () => withImpl(async impl => {
+      let asked = seedCollaborators(impl);
+      seedGatekeeper(impl, 2);
+      await expect(impl.getObserverVerifier(2, CALLER, viewer("alice"), true))
+          .rejects.toThrow(/not configured an account/);
+      expect(asked).toEqual([]);
+    }));
+  });
+});
 
 let doCounter = 0;
 
@@ -460,6 +705,30 @@ describe("restarting sessions when verification scope widens", () => {
     // choice she made -- it records that choice, not a verification result.
     expect(impl.storage.observers.get("alice").accountChoices).toEqual({ 1: 10 });
     expect(restarts).toEqual([]);
+  }));
+
+  it("tells each connection what the collaborator is being admitted for",
+      () => withImpl(async (impl) => {
+    seedGatekeeper(impl, 1);
+    seedGadget(impl, 100);
+    impl.bindWorkpiece(100, "DB", 1);
+    impl.storage.observers.put(
+        { profileId: "alice", observerId: "obs-1", accountChoices: { 1: 10 } });
+    let admissions: unknown[] = [];
+    impl.getGatekeeperFacet = () => ({
+      addObserver: async (_id: string, _verifier: unknown, admission?: unknown) => {
+        admissions.push(admission);
+      },
+      removeObserver: async () => {},
+    });
+    let fakeClientUser =
+        { getVerifier: async () => ({}), describeConnectedAccount: async () => null } as any;
+
+    // A build collaborator reads the workspace's chats; a use collaborator only runs the gadget.
+    await impl.ensureObserver("alice", fakeClientUser, "workspace");
+    await impl.ensureObserver("alice", fakeClientUser, { gadgetId: 100 });
+
+    expect(admissions).toEqual(["workspace", "gadget"]);
   }));
 
   // A pre-creationSpec record, which observerVendorId() refuses to classify: nobody can be
@@ -1114,7 +1383,9 @@ describe("gadget facet stubs count as sessions", () => {
       authorizeGadget: async () => true,
       getGadgetRecord: (id: number) => impl.getGadgetRecord(id),
       getGadgetFacet: (id: number, chatId?: number, joinAs?: string) =>
-          impl.getGadgetFacet(id, chatId, joinAs),
+        impl.getGadgetFacet(id, chatId, joinAs),
+      getObserverRuntimeKey: (profileId: string, userId: string) =>
+        impl.getObserverRuntimeKey(profileId, userId),
       recordGadgetAnalytics: () => {},
       users: { idFromString: (id: string) => id,
                get: () => ({

@@ -95,6 +95,10 @@ const stashedTickets = new Map<string, string>();
  */
 export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
   name: string; failRevoke?: boolean; failDescribe?: boolean; providesUi?: boolean;
+  /** Grants the account reports in its description, and offers one grantable resource type. */
+  grants?: string[];
+  /** How long describe() takes to answer. */
+  describeDelayMs?: number;
 }> {
   #record(call: string) {
     const calls = accountCalls.get(this.ctx.props.name) ?? [];
@@ -104,12 +108,20 @@ export class FakeGatekeeperAccount extends WorkerEntrypoint<Cloudflare.Env, {
 
   async describe(): Promise<AccountDescription> {
     this.#record("describe");
+    if (this.ctx.props.describeDelayMs) {
+      await new Promise(resolve => setTimeout(resolve, this.ctx.props.describeDelayMs));
+    }
     if (this.ctx.props.failDescribe) throw new Error("describe failed");
     return {
+      ...(this.ctx.props.grants ? { grantedResourceUrlPatterns: this.ctx.props.grants } : {}),
       displayName: this.ctx.props.name,
       uniqueName: this.ctx.props.name,
       ...(this.ctx.props.providesUi ? { providesUi: { title: this.ctx.props.name } } : {}),
     };
+  }
+
+  async getSupportedResources(): Promise<unknown[]> {
+    return this.ctx.props.grants ? [{ urlPattern: "https://example.com/:id", grantable: true }] : [];
   }
 
   async revoke(): Promise<void> {

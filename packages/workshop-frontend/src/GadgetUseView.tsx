@@ -18,6 +18,7 @@ import GadgetExportMenu from './GadgetExportMenu'
 import { GadgetSnapshotStatus } from './GadgetSnapshotStatus'
 import { GadgetSnapshotCard } from './GadgetSnapshotCard'
 import { GadgetUseTitle } from './GadgetUseTitle'
+import { PendingObserverActions } from './PendingObserverActions'
 
 // The minimal, "use"-only experience: a shared top bar plus the gadget's deployed UI, and nothing
 // else. Collaborators with the "use" role may only render and interact with the gadget's mainline
@@ -26,7 +27,7 @@ import { GadgetUseTitle } from './GadgetUseTitle'
 // overseer and gadget passed in here are the restricted capabilities returned by openWorkspace() for
 // "use" sessions; calling anything outside getMetadata()/subscribeToMetadata()/subscribeToPresence()/
 // subscribeToWorkpieces()/getGadget() (and, on the gadget, UI connection and export methods)
-// would throw.
+// would throw, apart from listing, approving and rejecting the writes this user initiated.
 //
 // When the workspace has more than one gadget, a simple picker in the top bar switches between
 // them (selection is owned by the parent, in the URL's `?w=` search param). Pending gadgets are
@@ -146,6 +147,7 @@ export default function GadgetUseView({
           ))}
         </div>
       )}
+      <PendingObserverActions overseer={overseer} />
 
       {/* ═══ GADGET UI ══════════════════════════════════════════════════════════ */}
       <div className="relative flex-1 min-h-0 overflow-hidden">

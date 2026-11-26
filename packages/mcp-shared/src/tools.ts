@@ -34,9 +34,8 @@ import { hexEncode } from "./util.js";
  * untrusted, argued in `classifyTool` below and stated on the connect form the user types the URL
  * into. Every other annotation is inert until a deployment vouches for the endpoint.
  *
- * This governs trust in annotations only. Neither tier can be shared (see `sharing-policy.ts`). It
- * is deployment configuration rather than account state, so read it afresh wherever it is used and
- * withdrawing it takes effect without a reconnect.
+ * This governs trust in annotations only. It is deployment configuration rather than account
+ * state, so read it afresh wherever it is used and withdrawing it takes effect without a reconnect.
  */
 export type ServerTrust = "vetted" | "byo";
 
